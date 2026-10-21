@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f4f7f5">
+  <meta name="description" content="A compact EVA reference for polished, responsive website design.">
+  <title>Northstar College — Website design reference</title>
+  <link rel="stylesheet" href="styles.css">
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="site-header">
+    <a class="brand" href="#top" aria-label="Northstar College home"><span class="brand-mark" aria-hidden="true">N</span><span>Northstar <small>COLLEGE</small></span></a>
+    <button class="menu-toggle" aria-expanded="false" aria-controls="primary-nav">Menu</button>
+    <nav id="primary-nav" aria-label="Main navigation"><a href="#programs">Programs</a><a href="#campus">Campus life</a><a href="#results">Results</a><a class="nav-action" href="#apply">Explore admissions <span aria-hidden="true">↗</span></a></nav>
+  </header>
+  <main id="main">
+    <section class="hero" id="top">
+      <div class="hero-copy">
+        <p class="eyebrow"><span></span> A place to find your next step</p>
+        <h1>Make room for<br><em>what’s next.</em></h1>
+        <p class="hero-lede">A welcoming campus, ambitious teaching, and the support to turn curiosity into meaningful work.</p>
+        <div class="hero-actions"><a class="button button-primary" href="#programs">Explore programs <span aria-hidden="true">→</span></a><a class="text-link" href="#campus">See campus life <span aria-hidden="true">↓</span></a></div>
+        <div class="hero-note"><span class="note-icon" aria-hidden="true">✦</span><span>Learn with purpose.<br><strong>Build with confidence.</strong></span></div>
+      </div>
+      <div class="hero-visual image-frame" id="campus">
+        <img class="hero-image" src="assets/campus-illustration.svg" alt="Illustrated school campus with trees, a welcoming building, and students walking along a path" width="900" height="1040" fetchpriority="high">
+        <div class="image-caption"><span class="caption-dot"></span> A campus made for possibility</div>
+        <div class="image-badge"><span>01</span><small>Curious<br>by nature</small></div>
+      </div>
+      <div class="hero-bottom"><span>LEARN · CONNECT · GO FURTHER</span><span>Find your direction <b aria-hidden="true">↓</b></span></div>
+    </section>
+    <section class="intro section-shell" id="programs">
+      <div class="section-heading"><p class="eyebrow">Your next chapter starts here</p><h2>Big ideas need<br><em>room to grow.</em></h2></div>
+      <div class="intro-copy"><p>Bring your questions, your point of view, and the things you haven’t figured out yet. You’ll find people ready to help you turn them into a future you can shape.</p><a class="text-link" href="#apply">Find your program <span aria-hidden="true">→</span></a></div>
+    </section>
+    <section class="feature-grid section-shell" aria-label="What makes Northstar distinct">
+      <article class="feature-card feature-teal"><span class="feature-number">01 / LEARN</span><div class="feature-icon" aria-hidden="true">↗</div><h3>Learn by doing</h3><p>Connect classroom ideas to studio projects, field work, and the questions that matter outside campus.</p></article>
+      <article class="feature-card feature-peach"><span class="feature-number">02 / BELONG</span><div class="feature-icon" aria-hidden="true">✳</div><h3>Find your people</h3><p>Join a close-knit community that makes space for different perspectives and shared discovery.</p></article>
+      <article class="feature-card feature-lilac"><span class="feature-number">03 / GROW</span><div class="feature-icon" aria-hidden="true">⌁</div><h3>Make a difference</h3><p>Build practical skills and confidence to take your next step with intention.</p></article>
+    </section>
+    <section class="results-band section-shell" id="results">
+      <div><p class="eyebrow">A thoughtful next step</p><h2>See where<br><em>you could go.</em></h2></div>
+      <div class="results-copy"><p>Explore learning paths, campus experiences, and the support available as you plan your future.</p><a class="button button-dark" href="#apply">Start exploring <span aria-hidden="true">→</span></a></div>
+      <span class="results-ornament" aria-hidden="true">✳</span>
+    </section>
+    <section class="closing section-shell" id="apply"><p class="eyebrow">The next move is yours</p><h2>Ready to begin?</h2><p>Take a closer look at what makes this place feel like yours.</p><a class="button button-primary" href="#top">Discover Northstar <span aria-hidden="true">→</span></a></section>
+  </main>
+  <footer class="site-footer"><a class="brand" href="#top"><span class="brand-mark" aria-hidden="true">N</span><span>Northstar <small>COLLEGE</small></span></a><p>Find your direction. Make it matter.</p><a href="#top" class="back-top">Back to top ↑</a></footer>
+</body>
+</html>
