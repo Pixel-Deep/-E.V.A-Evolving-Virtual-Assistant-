@@ -2,7 +2,7 @@
 """Deterministic arithmetic, geometric, harmonic, and Fibonacci solver."""
 
 import re
-from decimal import Decimal, localcontext
+from decimal import Decimal, DivisionByZero, InvalidOperation, localcontext
 
 
 def _number(value: str) -> Decimal:
@@ -77,7 +77,10 @@ def solve_progression(text: str) -> str:
                 d = r2 - r1
                 if r3 - r2 != d:
                     return "These terms do not form a harmonic progression."
-                terms = [Decimal(1) / (r1 + i * d) for i in range(n)]
+                try:
+                    terms = [Decimal(1) / (r1 + i * d) for i in range(n)]
+                except (DivisionByZero, InvalidOperation):
+                    return "Harmonic progression is undefined when a term denominator becomes zero."
                 preview = ", ".join(_fmt(t) for t in terms[:12])
                 if len(terms) > 12:
                     preview += ", ..."
@@ -165,7 +168,7 @@ def solve_progression(text: str) -> str:
         difference2 = third - second
 
         if "geometric" in lower or re.search(r"\bGP\b", text):
-            if first == 0 or second % first != 0:
+            if first == 0:
                 return (
                     "I couldn't verify a constant geometric ratio "
                     "from these terms."

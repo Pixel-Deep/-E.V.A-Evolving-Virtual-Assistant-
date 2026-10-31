@@ -73,6 +73,18 @@ class BenchmarkRegressionTests(unittest.TestCase):
         ):
             self.assertEqual(router.route(prompt).handler, "math_engine", prompt)
 
+    def test_coordinate_geometry_variants_are_deterministically_routed(self):
+        router = TaskRouter()
+        prompts = (
+            "Find the distance between (-2, 3) and (4, -5).",
+            "What is the midpoint of (-2, 3) and (4, -5)?",
+            "Calculate the slope between A(-2, 3) and B(4, -5).",
+            "Find the gradient of points (1.5, -2) and (3, 4).",
+        )
+        for prompt in prompts:
+            with self.subTest(prompt=prompt):
+                self.assertEqual(router.route(prompt).handler, "math_engine", prompt)
+
     def test_contextual_math_result_and_original_expression(self):
         eva = EVAOrchestrator()
         conversation = [

@@ -28,6 +28,14 @@ class EverydayMathCoverageTests(unittest.TestCase):
         self.assertEqual(solve_math("cot(pi/4)"), "Result = 1")
         self.assertEqual(solve_math("sec(0)"), "Result = 1")
 
+    def test_inclusive_integer_range_sum(self):
+        self.assertEqual(solve_math("Calculate the sum of the integers from 1 through 100"),
+                         "Sum from 1 through 100 = 5050")
+        self.assertEqual(TaskRouter().route("Calculate the sum of the integers from 1 through 100").handler,
+                         "math_engine")
+        with self.assertRaisesRegex(ValueError, "starting value"):
+            solve_math("sum of integers from 10 through 1")
+
     def test_calculus(self):
         self.assertIn("6*x", solve_math("differentiate 3x^2"))
         self.assertEqual(solve_math("differentiate y^3 with respect to y"), "Derivative = 3*y**2")
@@ -43,6 +51,8 @@ class EverydayMathCoverageTests(unittest.TestCase):
 
     def test_statistics(self):
         self.assertEqual(solve_math("mean of 2, 4, 6, 8"), "Mean = 5")
+        self.assertEqual(solve_math("Calculate the average of 12, 18, 25, 31 and 44"), "Mean = 26")
+        self.assertEqual(solve_math("average of 12, 18, 25, 31, and 44"), "Mean = 26")
         self.assertEqual(solve_math("median of 1, 3, 9"), "Median = 3")
         self.assertEqual(solve_math("mode of 1, 1, 2, 3"), "Mode = 1")
 

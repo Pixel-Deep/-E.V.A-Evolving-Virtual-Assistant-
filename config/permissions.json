@@ -1,0 +1,14 @@
+{
+  "profile": "trusted",
+  "allowed_permissions": [
+    "filesystem.read", "filesystem.write", "filesystem.copy", "filesystem.move",
+    "document.read", "document.write", "system.inspect", "app.launch",
+    "desktop.input", "clipboard.read", "clipboard.write", "browser.navigate",
+    "browser.read", "browser.interact", "network.http", "developer.read", "developer.test"
+  ],
+  "denied_permissions": [
+    "system.admin", "credentials.read", "payments", "security.disable",
+    "filesystem.delete", "account.modify", "content.publish", "message.send"
+  ],
+  "approval_required_risks": ["high", "critical"]
+}

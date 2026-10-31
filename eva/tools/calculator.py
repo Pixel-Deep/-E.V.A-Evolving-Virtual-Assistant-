@@ -1,4 +1,5 @@
 """Safe, deterministic arithmetic for EVA."""
+from __future__ import annotations
 
 import ast
 import math as _math
@@ -10,6 +11,7 @@ from decimal import (
     InvalidOperation,
     localcontext,
 )
+from typing import Any
 
 
 _BINARY_OPERATORS = {
@@ -30,6 +32,14 @@ _MAX_EXPRESSION_LENGTH = 500
 _MAX_AST_NODES = 100
 _MAX_EXPONENT = 100
 
+
+def _safe_factorial(x: Any) -> Decimal:
+    val = int(x)
+    if val < 0 or val > 500:
+        raise ValueError("Factorial input must be an integer between 0 and 500.")
+    return Decimal(_math.factorial(val))
+
+
 _SCIENTIFIC_FUNCTIONS = {
     "sqrt": lambda x: Decimal(str(_math.sqrt(float(x)))),
     "abs": lambda x: abs(x),
@@ -45,7 +55,7 @@ _SCIENTIFIC_FUNCTIONS = {
     "ceil": lambda x: Decimal(_math.ceil(float(x))),
     "floor": lambda x: Decimal(_math.floor(float(x))),
     "round": lambda x: Decimal(round(float(x))),
-    "factorial": lambda x: Decimal(_math.factorial(int(x))),
+    "factorial": _safe_factorial,
     "exp": lambda x: Decimal(str(_math.exp(float(x)))),
 }
 

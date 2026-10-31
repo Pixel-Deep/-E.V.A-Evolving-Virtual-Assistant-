@@ -1321,7 +1321,7 @@ def _is_junit_only_failure(detail: str) -> bool:
     return all(any(marker in line for marker in benign) for line in errors)
 
 
-def _validate_project(root: Path, files: dict[str, str], *, request: str = "") -> list[dict[str, str]]:
+def _validate_project(root: Path, files: dict[str, str], *, request: str = "", allow_runtime_execution: bool = False) -> list[dict[str, str]]:
     checks: list[dict[str, str]] = []
     # Syntax/compile checks are static. Generated source is never executed here.
     # Preflight source content independently of compiler exit codes: an empty
@@ -1350,14 +1350,22 @@ def _validate_project(root: Path, files: dict[str, str], *, request: str = "") -
             continue
         path = root / rel
         ext = path.suffix.lower()
-        if ext in {".py", ".pyi", ".c", ".h", ".cpp", ".cc", ".cxx", ".hpp", ".js", ".mjs", ".cjs", ".css", ".html", ".htm", ".json", ".xml", ".svg"}:
+        if ext == ".java":
+            continue
+        if ext in source_exts:
             try:
                 result = validate_file(path, timeout_seconds=12)
                 checks.append({"file": rel, "status": result["status"], "message": result["message"][:2000]})
             except Exception as exc:  # validation failure must be recorded, not hide the artifact
                 checks.append({"file": rel, "status": "error", "message": f"{type(exc).__name__}: {exc}"[:2000]})
+        elif ext not in {".md", ".markdown", ".txt", ".rst", ".gitignore", ".gitattributes", ".png", ".jpg", ".jpeg", ".gif", ".ico", ".lock"}:
+            try:
+                result = validate_file(path, timeout_seconds=12)
+                checks.append({"file": rel, "status": result["status"], "message": result["message"][:2000]})
+            except Exception as exc:
+                checks.append({"file": rel, "status": "error", "message": f"{type(exc).__name__}: {exc}"[:2000]})
 
-    if re.search(r"\bfactorial\b", request.lower()) and re.search(r"\b(python|py)\b", request.lower()):
+    if allow_runtime_execution and re.search(r"\bfactorial\b", request.lower()) and re.search(r"\b(python|py)\b", request.lower()):
         py_files = [rel for rel in files if rel.lower().endswith(".py")]
         if not py_files:
             checks.append({"file": "<python-runtime-tests>", "status": "failed", "message": "No Python source file was generated for the factorial request."})
@@ -1416,10 +1424,9 @@ def _validate_project(root: Path, files: dict[str, str], *, request: str = "") -
                     checks.append({"file": "<java-project>", "status": status, "message": detail or "Java project compilation failed."})
                 else:
                     checks.append({"file": "<java-project>", "status": "passed", "message": "Java main sources compiled successfully."})
-                    # For a requested Java factorial program, execute a bounded, deterministic
-                    # stdin test matrix against the compiled main class. This catches runtime
-                    # formatter errors (e.g. %ld) that compilation cannot detect.
-                    if "factorial" in request.lower() and "java" in request.lower():
+                    # When explicitly requested and approved, execute a bounded, deterministic
+                    # stdin test matrix against the compiled main class in an isolated check.
+                    if allow_runtime_execution and "factorial" in request.lower() and "java" in request.lower():
                         java = shutil.which("java")
                         candidates = []
                         for rel in main_java:
@@ -1760,10 +1767,11 @@ def _build_website_content_derived(request: str) -> dict[str, Any]:
 class ProjectAgent:
     """Create a general-purpose project with one bounded local-model call."""
 
-    def __init__(self, provider, output_root: str | Path | None = None, timeout_seconds: int = 150):
+    def __init__(self, provider, output_root: str | Path | None = None, timeout_seconds: int = 150, *, allow_runtime_execution: bool = False):
         self.provider = provider
         self.output_root = Path(output_root or (Path.home() / ".eva" / "generated")).expanduser().resolve()
         self.timeout_seconds = max(20, min(int(timeout_seconds), 180))
+        self.allow_runtime_execution = allow_runtime_execution
 
     def _build_website_with_engine(self, request: str) -> tuple[dict[str, str], dict[str, Any]]:
         """Use the deterministic website engine: LLM generates only text content."""
@@ -1910,10 +1918,11 @@ class ProjectAgent:
             raise ProjectGenerationError("Plain-text repair returned no recognized affected files.")
         return result
 
-    def build(self, request: str) -> dict[str, Any]:
+    def build(self, request: str, *, allow_runtime_execution: bool | None = None) -> dict[str, Any]:
         request = request.strip()
         if not request:
             raise ProjectGenerationError("Please describe the project you want EVA to build.")
+        runtime_exec = self.allow_runtime_execution if allow_runtime_execution is None else allow_runtime_execution
         self.output_root.mkdir(parents=True, exist_ok=True)
         started = time.monotonic()
 
@@ -2055,7 +2064,7 @@ Write SIMPLE, STANDARD code using only well-known standard-library APIs you are 
                     (target / "TEST_PLAN.md").write_text("# Test plan\n\n" + "\n".join(f"- {str(x)}" for x in test_plan if isinstance(x, str)) + "\n", encoding="utf-8")
                     files["TEST_PLAN.md"] = (target / "TEST_PLAN.md").read_text(encoding="utf-8")
 
-            checks = _validate_project(target, files, request=request)
+            checks = _validate_project(target, files, request=request, allow_runtime_execution=runtime_exec)
             failed = [c for c in checks if c["status"] in {"failed", "error", "timeout"}]
             repair_attempts = 0
             repair_note = "not_needed"
@@ -2079,7 +2088,7 @@ Write SIMPLE, STANDARD code using only well-known standard-library APIs you are 
                         fixed_out = (target / fixed_rel).resolve()
                         if target in fixed_out.parents:
                             fixed_out.write_text(files[fixed_rel], encoding="utf-8", newline="\n")
-                    checks = _validate_project(target, files, request=request)
+                    checks = _validate_project(target, files, request=request, allow_runtime_execution=runtime_exec)
                     failed = [c for c in checks if c["status"] in {"failed", "error", "timeout"}]
                 affected: set[str] = set()
                 for item in failed:
@@ -2123,7 +2132,7 @@ Write SIMPLE, STANDARD code using only well-known standard-library APIs you are 
                                 raise ProjectGenerationError(f"Unsafe repair path: {rel!r}")
                             out.write_text(content, encoding="utf-8", newline="\n")
                             files[rel] = content
-                        checks = _validate_project(target, files, request=request)
+                        checks = _validate_project(target, files, request=request, allow_runtime_execution=runtime_exec)
                         failed = [c for c in checks if c["status"] in {"failed", "error", "timeout"}]
                         # The repair model may have reintroduced missing-import
                         # bugs, so run the free deterministic import fix again.
@@ -2140,7 +2149,7 @@ Write SIMPLE, STANDARD code using only well-known standard-library APIs you are 
                                 fixed_out2 = (target / fixed_rel2).resolve()
                                 if target in fixed_out2.parents:
                                     fixed_out2.write_text(files[fixed_rel2], encoding="utf-8", newline="\n")
-                            checks = _validate_project(target, files, request=request)
+                            checks = _validate_project(target, files, request=request, allow_runtime_execution=runtime_exec)
                             failed = [c for c in checks if c["status"] in {"failed", "error", "timeout"}]
                         repair_note = "passed" if not failed else "attempted_but_failures_remain"
                     except Exception as repair_error:

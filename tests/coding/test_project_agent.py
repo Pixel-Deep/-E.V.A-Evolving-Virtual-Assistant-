@@ -78,7 +78,7 @@ class ProjectAgentTests(unittest.TestCase):
                    "run_instructions": ["javac Main.java", "java Main"],
                    "test_plan": ["Try 0, 1 and 5"], "assumptions": []}
         with tempfile.TemporaryDirectory() as td:
-            result = ProjectAgent(FakeProvider(payload), output_root=td).build(
+            result = ProjectAgent(FakeProvider(payload), output_root=td, allow_runtime_execution=True).build(
                 "Write a program in Java to print the factorial of a number")
             main_file = Path(result["project_path"]) / "Main.java"
             self.assertGreater(main_file.stat().st_size, 0)
@@ -907,6 +907,45 @@ public class Main {
             self.assertEqual(provider.calls, 1)
             self.assertTrue(list(Path(td).glob("*.zip")))
 
+
+
+    def test_typescript_file_receives_explicit_validation_and_cannot_pass_when_unsupported(self):
+        from eva.coding.project_agent import _validate_project
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            files = {
+                "package.json": json.dumps({"name": "test-pkg", "version": "1.0.0"}),
+                "index.ts": "const malformed: = invalid typescript ;;;",
+            }
+            (root / "package.json").write_text(files["package.json"], encoding="utf-8")
+            (root / "index.ts").write_text(files["index.ts"], encoding="utf-8")
+            checks = _validate_project(root, files, request="TypeScript test")
+            ts_check = [c for c in checks if c["file"] == "index.ts"]
+            self.assertTrue(ts_check, "Every source file must receive an explicit validation check")
+            self.assertIn(ts_check[0]["status"], {"unsupported", "failed"})
+            has_failure = any(c["status"] in {"failed", "error", "timeout"} for c in checks)
+            has_unchecked = any(c["status"] in {"unsupported", "skipped"} for c in checks)
+            validation_status = "failed" if has_failure else "partial" if has_unchecked else "passed" if checks else "not_available"
+            self.assertNotEqual(validation_status, "passed", "Project with unvalidated/malformed TS must not receive passed status")
+
+    def test_generated_python_code_never_executed_during_validation_by_default(self):
+        from eva.coding.project_agent import _validate_project
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            marker = root / "pwned.marker"
+            code = f"""
+from pathlib import Path
+marker = Path({str(marker)!r})
+marker.write_text("executed!", encoding="utf-8")
+n = int(input())
+print(1)
+"""
+            files = {"factorial.py": code}
+            (root / "factorial.py").write_text(code, encoding="utf-8")
+            checks = _validate_project(root, files, request="Write a python program to calculate factorial")
+            self.assertFalse(marker.exists(), "Generated python code must not be executed during validation")
+            runtime_checks = [c for c in checks if c["file"] in {"<python-runtime-tests>", "<java-runtime-tests>"}]
+            self.assertEqual(len(runtime_checks), 0, "No runtime tests should be added when allow_runtime_execution is False")
 
 
 if __name__ == "__main__":

@@ -1,0 +1,20 @@
+name: extract_zip
+version: 1
+description: Safely extract a ZIP archive into a new destination directory.
+inputs:
+  source:
+    type: string
+    minLength: 1
+    maxLength: 4096
+    required: true
+  destination:
+    type: string
+    minLength: 1
+    maxLength: 4096
+    required: true
+steps:
+  - id: extract
+    tool: archive.zip_extract
+    args:
+      source: "${inputs.source}"
+      destination: "${inputs.destination}"

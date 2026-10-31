@@ -85,10 +85,12 @@ def main():
     code, d, _ = pc("ip")
     check("ip reports a local address", code == 0 and bool(d.get("local")))
     code, d, _ = pc("ip", "--public")
-    if d.get("public"):
-        check("ip --public resolves", True)
+    if (code == 0 and d.get("public_lookup") == "disabled_no_external_service"
+            and d.get("public") is None):
+        record("SKIP", "ip --public", "public-IP lookup intentionally omitted; no external lookup service is contacted")
     else:
-        record("SKIP", "ip --public", "network unavailable")
+        check("ip --public fails closed without an external lookup service", False,
+              "expected public lookup to be explicitly disabled")
 
     # -- apps
     code, d, _ = pc("apps")

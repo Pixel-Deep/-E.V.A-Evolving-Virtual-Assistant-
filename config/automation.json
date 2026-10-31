@@ -1,0 +1,13 @@
+{
+  "profile": "scoped_workspace",
+  "description": "Routine operations are scoped to the EVA workspace and explicitly selected user folders. High-impact actions require run-scoped approval; credential exclusions, destructive path blocks, and approval requirements remain strictly enforced.",
+  "allowed_roots": [
+    ".",
+    "~/EVA-Workspace",
+    "~/Downloads",
+    "~/Documents",
+    "~/Desktop"
+  ],
+  "audit_log": "~/.eva/logs/automation.jsonl",
+  "allow_local_browser_urls": false
+}

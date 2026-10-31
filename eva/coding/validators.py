@@ -197,6 +197,14 @@ def validate_file(path: str | Path, *, timeout_seconds: int = 10) -> dict:
         parser = ParseCheck()
         parser.feed_checked(source)
         return _result(p, "HTML", "failed" if parser.error else "passed", parser.error or "HTML parser accepted the document; browser conformance is not fully checked.")
+    canonical_langs = {
+        ".js": "JavaScript", ".mjs": "JavaScript", ".cjs": "JavaScript",
+        ".ts": "TypeScript", ".tsx": "TypeScript",
+        ".rs": "Rust", ".go": "Go",
+        ".c": "C", ".h": "C",
+        ".cpp": "C++", ".cc": "C++", ".cxx": "C++", ".hpp": "C++",
+    }
+    target_lang = canonical_langs.get(ext, ext.lstrip('.') or "unknown")
     if ext in {".js", ".mjs", ".cjs"}:
         node = shutil.which("node")
         if not node:
@@ -218,20 +226,55 @@ def validate_file(path: str | Path, *, timeout_seconds: int = 10) -> dict:
                 return _result(p, "Java", "timeout", "Static validator timed out.", command)
             except OSError as exc:
                 return _result(p, "Java", "error", str(exc), command)
-    elif ext in {".c", ".h"} and shutil.which("gcc"):
-        command = [shutil.which("gcc"), "-x", "c", "-fsyntax-only", str(p)]
-    elif ext in {".cpp", ".cc", ".cxx", ".hpp"} and shutil.which("g++"):
-        command = [shutil.which("g++"), "-x", "c++", "-fsyntax-only", str(p)]
+    elif ext in {".ts", ".tsx"}:
+        tsc = shutil.which("tsc") or shutil.which("tsc.cmd")
+        if not tsc:
+            return _result(p, "TypeScript", "unsupported", "tsc is unavailable; TypeScript syntax was not checked.")
+        if tsc.lower().endswith((".cmd", ".bat")):
+            command = ["cmd.exe", "/c", tsc, "--noEmit", str(p)]
+        else:
+            command = [tsc, "--noEmit", str(p)]
+    elif ext == ".rs":
+        rustc = shutil.which("rustc") or shutil.which("rustc.exe")
+        if not rustc:
+            return _result(p, "Rust", "unsupported", "rustc is unavailable; Rust syntax was not checked.")
+        import os
+        command = [rustc, "--crate-type", "lib", "--emit=metadata", "-o", os.devnull, str(p)]
+    elif ext == ".go":
+        go = shutil.which("go") or shutil.which("go.exe")
+        if not go:
+            return _result(p, "Go", "unsupported", "go is unavailable; Go syntax was not checked.")
+        command = [go, "vet", str(p)]
+    elif ext in {".c", ".h"}:
+        gcc = shutil.which("gcc") or shutil.which("clang")
+        if gcc:
+            command = [gcc, "-x", "c", "-fsyntax-only", str(p)]
+        else:
+            cl = shutil.which("cl") or shutil.which("cl.exe")
+            if cl:
+                command = [cl, "/Zs", "/nologo", str(p)]
+            else:
+                return _result(p, "C", "unsupported", "gcc/clang/cl is unavailable; C syntax was not checked.")
+    elif ext in {".cpp", ".cc", ".cxx", ".hpp"}:
+        gpp = shutil.which("g++") or shutil.which("clang++")
+        if gpp:
+            command = [gpp, "-x", "c++", "-fsyntax-only", str(p)]
+        else:
+            cl = shutil.which("cl") or shutil.which("cl.exe")
+            if cl:
+                command = [cl, "/Zs", "/nologo", "/EHsc", str(p)]
+            else:
+                return _result(p, "C++", "unsupported", "g++/clang++/cl is unavailable; C++ syntax was not checked.")
     else:
-        language = {".ts": "TypeScript", ".tsx": "TypeScript/TSX", ".rs": "Rust", ".go": "Go"}.get(ext, "unknown")
-        return _result(p, language, "unsupported", "No configured static validator is available for this file type on this machine.")
+        language = {".ts": "TypeScript", ".tsx": "TypeScript/TSX", ".rs": "Rust", ".go": "Go"}.get(ext, ext.lstrip('.') or "unknown")
+        return _result(p, language, "unsupported", f"No configured static validator is available for this file type ({ext}) on this machine.")
     try:
         completed = subprocess.run(command, cwd=str(p.parent), capture_output=True, text=True,
                                    timeout=max(1, min(timeout_seconds, 30)), shell=False)
         output = (completed.stderr or completed.stdout or "").strip()
-        return _result(p, ext[1:], "passed" if completed.returncode == 0 else "failed",
+        return _result(p, target_lang, "passed" if completed.returncode == 0 else "failed",
                        output[:8000] or ("Syntax check passed." if completed.returncode == 0 else "Validator failed without diagnostics."), command)
     except subprocess.TimeoutExpired:
-        return _result(p, ext[1:], "timeout", "Static validator timed out.", command)
+        return _result(p, target_lang, "timeout", "Static validator timed out.", command)
     except OSError as exc:
-        return _result(p, ext[1:], "error", str(exc), command)
+        return _result(p, target_lang, "error", str(exc), command)

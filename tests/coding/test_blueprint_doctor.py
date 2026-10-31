@@ -81,6 +81,31 @@ class BlueprintTests(unittest.TestCase):
         self.assertIn("errors", result["summary"])
         self.assertTrue(any(x["name"] == "blueprint_engine" for x in result["checks"]))
 
+    def test_refuses_symlink_target_pointing_inside(self):
+        real_empty_dir = self.root / "real_inside"
+        real_empty_dir.mkdir()
+        symlink_target = self.root / "symlink_inside"
+        try:
+            symlink_target.symlink_to(real_empty_dir, target_is_directory=True)
+        except OSError:
+            self.skipTest("Symlink creation not permitted in this environment")
+        with self.assertRaises(FileExistsError):
+            build_blueprint(self.spec, symlink_target)
+        self.assertEqual(len(list(real_empty_dir.iterdir())), 0, "No files should be written into the symlink target")
+
+    def test_refuses_symlink_target_pointing_outside(self):
+        with tempfile.TemporaryDirectory() as outside_td:
+            outside_dir = Path(outside_td) / "real_outside"
+            outside_dir.mkdir()
+            symlink_target = self.root / "symlink_outside"
+            try:
+                symlink_target.symlink_to(outside_dir, target_is_directory=True)
+            except OSError:
+                self.skipTest("Symlink creation not permitted in this environment")
+            with self.assertRaises(FileExistsError):
+                build_blueprint(self.spec, symlink_target)
+            self.assertEqual(len(list(outside_dir.iterdir())), 0, "No files should be written into external symlink target")
+
 
 if __name__ == "__main__":
     unittest.main()

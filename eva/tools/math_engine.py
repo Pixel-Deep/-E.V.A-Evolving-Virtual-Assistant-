@@ -7,6 +7,7 @@ limited and arbitrary Python names/attributes are rejected.
 """
 from __future__ import annotations
 
+import keyword
 import math
 import re
 from typing import Optional
@@ -32,16 +33,19 @@ _ALLOWED_NAMES = {
     "log": sp.log, "ln": sp.log, "log10": lambda x: sp.log(x, 10),
     "exp": sp.exp, "abs": sp.Abs,
     "factorial": sp.factorial, "floor": sp.floor, "ceil": sp.ceiling,
-    "degrees": lambda x: x * sp.pi / 180, "sqrt": sp.sqrt,
+    "degrees": lambda x: x * sp.pi / 180,
 }
 _VARIABLES = {"x", "y", "z", "t", "a", "b", "c", "d", "n", "r", "i", "j", "k", "u", "v", "w", "theta", "alpha", "beta", "lambda", "p", "q", "m", "s", "f", "g", "h"}
+_BLOCKED_NAMES = set(keyword.kwlist) | {
+    "__builtins__", "eval", "exec", "globals", "locals", "system", "os", "subprocess", "compile", "open", "input"
+}
 _SUPERS = {"⁰":"0", "¹":"1", "²":"2", "³":"3", "⁴":"4", "⁵":"5", "⁶":"6", "⁷":"7", "⁸":"8", "⁹":"9"}
 _SUP_DIGITS = "⁰¹²³⁴⁵⁶⁷⁸⁹"
 
 
 def _normalise(text: str) -> str:
     s = text.strip().lower()
-    for old, new in (("−", "-"), ("–", "-"), ("×", "*"), ("÷", "/"), ("·", "*"), ("π", " pi "), ("√", " sqrt "), ("²", "²")):
+    for old, new in (("−", "-"), ("–", "-"), ("×", "*"), ("÷", "/"), ("·", "*"), ("π", " pi "), ("√", " sqrt ")):
         s = s.replace(old, new)
     # Convert Unicode subscripts in logarithm bases: log₂(32) -> log(32,2).
     sub_digits = str.maketrans("₀₁₂₃₄₅₆₇₈₉", "0123456789")
@@ -162,10 +166,9 @@ def _safe_parse(expression: str):
     local = dict(_ALLOWED_NAMES)
     for name in re.findall(r"\b[a-zA-Z]\w*\b", expression):
         if name not in local:
-            if name in _VARIABLES or len(name) == 1:
-                local[name] = sp.Symbol(name)
-            else:
+            if name in _BLOCKED_NAMES or name.startswith("__"):
                 raise ValueError(f"Unsupported mathematical function or symbol: {name}")
+            local[name] = sp.Symbol(name)
     try:
         result = parse_expr(expression, local_dict=local, transformations=_TRANSFORMS, evaluate=True)
     except Exception as exc:
@@ -262,12 +265,18 @@ def _stats(text: str) -> Optional[str]:
     elif re.search(r"\bvariance\b", low): operation = "variance"
     if not operation: return None
     # Pull values from after common separators to avoid accidentally using the word's digits.
-    data_match = re.search(r"(?:of|are|:|data(?: set)?\s*)\s*([-+\d.,\s]+)", low)
+    # Include a final value introduced by "and" (e.g. "average of 12, 18, 25, 31 and 44").
+    # The old numeric-only capture stopped before "and", silently dropping the last value.
+    data_match = re.search(
+        r"(?:of|are|:|data(?: set)?\s*)\s*([-+\d.,\s]+(?:\band\s+[-+]?\d+(?:\.\d+)?)?)",
+        low,
+    )
     values_text = data_match.group(1) if data_match else low
     nums = _parse_numbers(values_text)
     if not nums:
         raise ValueError("Provide a data set, for example: mean of 2, 4, 6, 8.")
     if len(nums) > 10000: raise ValueError("Please limit a data set to 10,000 values.")
+    if any(len(str(num)) > 100 for num in nums): raise ValueError("Each value must be 100 digits or fewer.")
     if operation == "mean": value = sp.Rational(sum(nums), len(nums)); label = "Mean"
     elif operation == "median":
         ordered = sorted(nums)
@@ -296,24 +305,46 @@ def _coordinate_geometry(text: str) -> Optional[str]:
     if len(pairs) >= 2 and any(k in low for k in ("distance", "midpoint", "slope", "gradient")):
         x1,y1 = map(sp.Rational,pairs[0]); x2,y2 = map(sp.Rational,pairs[1])
         if "distance" in low:
-            return f"Distance = {_fmt(sp.sqrt((x2-x1)**2+(y2-y1)**2))}"
+            dist = sp.sqrt((x2-x1)**2+(y2-y1)**2)
+            if "explain" in low:
+                return f"Distance = {_fmt(dist)}\nCalculation: Distance formula is sqrt((x2 - x1)^2 + (y2 - y1)^2) = sqrt(({_fmt(x2)} - {_fmt(x1)})^2 + ({_fmt(y2)} - {_fmt(y1)})^2) = {_fmt(dist)}."
+            return f"Distance = {_fmt(dist)}"
         if "midpoint" in low:
-            return f"Midpoint = ({_fmt((x1+x2)/2)}, {_fmt((y1+y2)/2)})"
+            mx, my = (x1 + x2) / 2, (y1 + y2) / 2
+            if "explain" in low:
+                return (f"Midpoint = ({_fmt(mx)}, {_fmt(my)})\n"
+                        f"Calculation: The midpoint between (x1, y1) and (x2, y2) is ((x1 + x2)/2, (y1 + y2)/2) = "
+                        f"(({_fmt(x1)} + {_fmt(x2)})/2, ({_fmt(y1)} + {_fmt(y2)})/2) = ({_fmt(mx)}, {_fmt(my)}).")
+            return f"Midpoint = ({_fmt(mx)}, {_fmt(my)})"
         if "slope" in low or "gradient" in low:
             if x2 == x1: return "Slope is undefined (the line is vertical)."
-            return f"Slope = {_fmt((y2-y1)/(x2-x1))}"
+            slp = (y2-y1)/(x2-x1)
+            if "explain" in low:
+                return f"Slope = {_fmt(slp)}\nCalculation: Slope formula is (y2 - y1) / (x2 - x1) = ({_fmt(y2)} - {_fmt(y1)}) / ({_fmt(x2)} - {_fmt(x1)}) = {_fmt(slp)}."
+            return f"Slope = {_fmt(slp)}"
     # Named points can be written A(1, 2) and B(4, 6).
     pts = re.findall(r"\b([a-z])\s*\(\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\)", low)
     if len(pts) >= 2:
         _, x1, y1 = pts[0]; _, x2, y2 = pts[1]
         x1,y1,x2,y2 = map(sp.Rational, (x1,y1,x2,y2))
         if "distance" in low:
-            return f"Distance = {_fmt(sp.sqrt((x2-x1)**2+(y2-y1)**2))}"
+            dist = sp.sqrt((x2-x1)**2+(y2-y1)**2)
+            if "explain" in low:
+                return f"Distance = {_fmt(dist)}\nCalculation: Distance formula is sqrt((x2 - x1)^2 + (y2 - y1)^2) = sqrt(({_fmt(x2)} - {_fmt(x1)})^2 + ({_fmt(y2)} - {_fmt(y1)})^2) = {_fmt(dist)}."
+            return f"Distance = {_fmt(dist)}"
         if "midpoint" in low:
-            return f"Midpoint = ({_fmt((x1+x2)/2)}, {_fmt((y1+y2)/2)})"
+            mx, my = (x1 + x2) / 2, (y1 + y2) / 2
+            if "explain" in low:
+                return (f"Midpoint = ({_fmt(mx)}, {_fmt(my)})\n"
+                        f"Calculation: The midpoint between (x1, y1) and (x2, y2) is ((x1 + x2)/2, (y1 + y2)/2) = "
+                        f"(({_fmt(x1)} + {_fmt(x2)})/2, ({_fmt(y1)} + {_fmt(y2)})/2) = ({_fmt(mx)}, {_fmt(my)}).")
+            return f"Midpoint = ({_fmt(mx)}, {_fmt(my)})"
         if "slope" in low or "gradient" in low:
             if x2 == x1: return "Slope is undefined (the line is vertical)."
-            return f"Slope = {_fmt((y2-y1)/(x2-x1))}"
+            slp = (y2-y1)/(x2-x1)
+            if "explain" in low:
+                return f"Slope = {_fmt(slp)}\nCalculation: Slope formula is (y2 - y1) / (x2 - x1) = ({_fmt(y2)} - {_fmt(y1)}) / ({_fmt(x2)} - {_fmt(x1)}) = {_fmt(slp)}."
+            return f"Slope = {_fmt(slp)}"
     return None
 
 
@@ -744,6 +775,20 @@ def solve_math(text: str) -> str:
     low = raw.lower()
     original_wording = low
 
+    # Resolve finite integer ranges before symbolic parsing sees words such as
+    # "integers" as unsupported identifiers.
+    range_sum = re.search(
+        r"\b(?:sum\s+of\s+)?(?:the\s+)?(?:integers|whole\s+numbers|numbers)\s+from\s+(-?\d+)\s+(?:through|to|up\s+to)\s+(-?\d+)\b",
+        raw, re.I,
+    )
+    if range_sum:
+        first, last = map(int, range_sum.groups())
+        if first > last:
+            raise ValueError("For an inclusive integer sum, the starting value must not exceed the ending value.")
+        count = last - first + 1
+        total = count * (first + last) // 2
+        return f"Sum from {first} through {last} = {total}"
+
     word_answer = _word_problem(raw)
     if word_answer is not None:
         return word_answer
@@ -876,8 +921,8 @@ def solve_math(text: str) -> str:
     gp = bool(re.search(r"\b(?:geometric progression|gp)\b", low))
     if ap or gp:
         nmatch = re.search(r"(?:first\s+)?(\d+)\s+terms?", low)
-        nthmatch = re.search(r"(?:\b(?:find|calculate|what is)?\s*)(\d+)(?:st|nd|rd|th)\s+term", low)
-        cleaned = re.sub(r"(?:first\s+)?\d+\s+terms?", " ", low)
+        nthmatch = re.search(r"\b(\d+)(?:st|nd|rd|th)\s+term\b|\bterm\s+(\d+)\b", low)
+        cleaned = re.sub(r"(?:first\s+)?\d+(?:st|nd|rd|th)?\s+terms?|\bterm\s+\d+", " ", low)
         # Prefer named a/d/r when supplied; otherwise infer the step/ratio from sequence values.
         if ap and re.search(r"common difference", low):
             a_match = re.search(r"first term\s*(?:is|=)?\s*(-?\d+(?:\.\d+)?)", low)
@@ -893,7 +938,7 @@ def solve_math(text: str) -> str:
             a = nums[0]
             step = (nums[1] / nums[0] if gp and nums[0] != 0 else nums[1]) if len(nums) == 2 else (nums[1] / nums[0] if gp and nums[0] != 0 else nums[1]-nums[0])
             if nthmatch:
-                n = int(nthmatch.group(1))
+                n = int(nthmatch.group(1) or nthmatch.group(2))
                 if n < 1 or n > 1000000: raise ValueError("Term number must be between 1 and 1,000,000.")
                 term = a*(step**(n-1)) if gp else a+(n-1)*step
                 return f"{'GP' if gp else 'AP'} term {n} = {_fmt(term)}"

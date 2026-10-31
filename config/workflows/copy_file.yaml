@@ -1,0 +1,20 @@
+name: copy_file
+version: 1
+description: Copy a regular file to a new destination without overwriting.
+inputs:
+  source:
+    type: string
+    minLength: 1
+    maxLength: 4096
+    required: true
+  destination:
+    type: string
+    minLength: 1
+    maxLength: 4096
+    required: true
+steps:
+  - id: copy
+    tool: files.copy
+    args:
+      source: "${inputs.source}"
+      destination: "${inputs.destination}"

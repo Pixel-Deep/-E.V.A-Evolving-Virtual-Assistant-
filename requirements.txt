@@ -1,3 +1,10 @@
 sympy>=1.13,<2
 pywhatkit>=5.4
 pyautogui>=0.9.54
+PyYAML>=6,<7
+playwright>=1.50,<2
+pywinauto>=0.6.8,<1; platform_system == "Windows"
+python-pptx>=1.0,<2
+openpyxl>=3.1,<4
+reportlab>=4,<5
+pypdf>=5,<7

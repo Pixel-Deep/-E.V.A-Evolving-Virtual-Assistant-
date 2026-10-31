@@ -115,8 +115,7 @@ class DesktopAutomationRoutingTests(unittest.TestCase):
 
     def test_spotify_app_suffix_plays_through_normal_desktop_dispatch(self):
         import eva.automation.desktop as desktop
-        with unittest.mock.patch.object(desktop, "_spotify_api_play", return_value=None), \
-             unittest.mock.patch.object(desktop, "_launch_spotify_app_search", return_value={
+        with unittest.mock.patch.object(desktop, "_launch_spotify_app_search", return_value={
                  "ok": True, "method": "spotify_app_search", "opened": "spotify:search:baby",
                  "playback_requested": False,
              }) as launch:
@@ -148,28 +147,28 @@ class DesktopAutomationRoutingTests(unittest.TestCase):
         fake_gui.write.assert_called_once_with("Baby Shark", interval=0.025)
         self.assertEqual([call.args[0] for call in fake_gui.press.call_args_list], ["enter", "tab", "enter", "space"])
 
-    def test_spotify_desktop_is_attempted_before_api_playback(self):
+    def test_spotify_uses_app_search_without_external_api_playback(self):
         import eva.automation.desktop as desktop
         order = []
         def app_search(song):
             order.append(("app", song))
-            return {"ok": True, "method": "spotify_app_search", "opened": "spotify:search:baby"}
-        def api_play(song):
-            order.append(("api", song))
-            return {"ok": True, "action": "play_spotify", "method": "spotify_web_api", "query": song,
-                    "playback_requested": True, "spotify_uri": "spotify:track:123"}
+            return {"ok": True, "method": "spotify_app_search", "opened": "spotify:search:baby",
+                    "playback_requested": False}
         with unittest.mock.patch.object(desktop, "_launch_spotify_app_search", side_effect=app_search), \
-             unittest.mock.patch.object(desktop, "_spotify_api_play", side_effect=api_play):
+             unittest.mock.patch.object(desktop, "_spotify_desktop_ui_play", return_value={
+                 "ok": True, "action": "play_spotify", "method": "spotify_desktop_ui",
+                 "query": "baby", "playback_requested": True, "playback_confirmed": False,
+             }):
             result = desktop.route_and_execute("play baby on spotify")
         self.assertTrue(result["ok"])
-        self.assertTrue(result["playback_requested"])
-        self.assertEqual(order, [("app", "baby"), ("api", "baby")])
+        self.assertTrue(result.get("playback_requested", False))
+        self.assertEqual(order, [("app", "baby")])
         self.assertEqual(result["app_launch"]["method"], "spotify_app_search")
+        self.assertFalse(hasattr(desktop, "_spotify_api_play"))
 
     def test_spotify_app_absent_falls_back_to_spotify_web(self):
         import eva.automation.desktop as desktop
-        with unittest.mock.patch.object(desktop, "_spotify_api_play", return_value=None), \
-             unittest.mock.patch.object(desktop, "_launch_spotify_app_search", return_value={
+        with unittest.mock.patch.object(desktop, "_launch_spotify_app_search", return_value={
                  "ok": False, "not_found": True, "error": "Spotify desktop app was not found."
              }), \
              unittest.mock.patch.object(desktop, "_open_browser_url", return_value={
@@ -182,8 +181,7 @@ class DesktopAutomationRoutingTests(unittest.TestCase):
 
     def test_spotify_song_uses_app_search_before_browser_fallback(self):
         import eva.automation.desktop as desktop
-        with unittest.mock.patch.object(desktop, "_spotify_api_play", return_value=None), \
-             unittest.mock.patch.object(desktop.platform, "system", return_value="Windows"), \
+        with unittest.mock.patch.object(desktop.platform, "system", return_value="Windows"), \
              unittest.mock.patch.object(desktop, "_ps", return_value={
                  "ok": True, "method": "spotify_app_search", "opened": "spotify:search:baby"
              }) as ps:
@@ -195,8 +193,7 @@ class DesktopAutomationRoutingTests(unittest.TestCase):
 
     def test_spotify_song_falls_back_to_web_when_app_uri_is_unavailable(self):
         import eva.automation.desktop as desktop
-        with unittest.mock.patch.object(desktop, "_spotify_api_play", return_value=None), \
-             unittest.mock.patch.object(desktop.platform, "system", return_value="Windows"), \
+        with unittest.mock.patch.object(desktop.platform, "system", return_value="Windows"), \
              unittest.mock.patch.object(desktop, "_ps", return_value={"ok": False, "not_found": True}), \
              unittest.mock.patch.object(desktop, "_open_browser_url", return_value={
                  "ok": True, "method": "browser", "opened": "https://open.spotify.com/search/baby"
@@ -248,27 +245,18 @@ class DesktopAutomationRoutingTests(unittest.TestCase):
         self.assertIn("Programs\\Microsoft VS Code\\Code.exe", script)
         self.assertIn("ProgramFiles(x86)", script)
 
-    def test_spotify_api_uses_configured_user_access_token(self):
+    def test_spotify_has_no_external_api_dependency(self):
         import eva.automation.desktop as desktop
-        class FakeResponse:
-            def __init__(self, payload=None, status=204):
-                self.payload = payload or {}
-                self.status = status
-            def __enter__(self): return self
-            def __exit__(self, *args): return False
-            def read(self): return __import__("json").dumps(self.payload).encode()
-        responses = [
-            FakeResponse({"tracks": {"items": [{"name": "Baby", "artists": [{"name": "Justin Bieber"}], "uri": "spotify:track:123"}]}}),
-            FakeResponse({}, 204),
-        ]
-        with unittest.mock.patch.dict("os.environ", {"SPOTIFY_ACCESS_TOKEN": "test-token"}), \
-             unittest.mock.patch.object(desktop, "urlopen", side_effect=responses) as urlopen_mock:
-            result = desktop._spotify_api_play("Baby")
+        self.assertFalse(hasattr(desktop, "_spotify_api_play"))
+        with unittest.mock.patch.object(desktop, "_launch_spotify_app_search", return_value={
+            "ok": False, "not_found": True, "error": "Spotify desktop app was not found."
+        }), unittest.mock.patch.object(desktop, "_open_browser_url", return_value={
+            "ok": True, "method": "browser", "opened": "https://open.spotify.com/search/baby"
+        }) as browser:
+            result = desktop.route_and_execute("play baby on spotify")
         self.assertTrue(result["ok"])
-        self.assertEqual(result["method"], "spotify_web_api")
-        self.assertTrue(result["playback_requested"])
-        self.assertEqual(result["spotify_uri"], "spotify:track:123")
-        self.assertEqual(urlopen_mock.call_count, 2)
+        self.assertEqual(result["method"], "browser_search_fallback")
+        browser.assert_called_once_with("https://open.spotify.com/search/baby")
 
     def test_common_apps_have_browser_fallback_urls(self):
         import eva.automation.desktop as desktop
@@ -462,7 +450,8 @@ class DesktopAutomationRoutingTests(unittest.TestCase):
     def test_browser_helper_requests_a_new_tab(self):
         import eva.automation.desktop as desktop
         url = "https://www.instagram.com"
-        with unittest.mock.patch.object(desktop.webbrowser, "open", return_value=True) as browser:
+        with unittest.mock.patch.object(desktop.platform, "system", return_value="Linux"), \
+             unittest.mock.patch.object(desktop.webbrowser, "open", return_value=True) as browser:
             result = desktop._open_browser_url(url)
         self.assertTrue(result["ok"])
         self.assertEqual(result["method"], "browser")
@@ -470,14 +459,18 @@ class DesktopAutomationRoutingTests(unittest.TestCase):
 
     def test_multi_site_request_reaches_real_browser_fallback_for_each_target(self):
         import eva.automation.desktop as desktop
+        opened = []
+        def fake_open(url):
+            opened.append(url)
+            return {"ok": True, "opened": url, "url": url, "method": "test_browser", "launch_requested": True}
         with unittest.mock.patch.object(desktop.platform, "system", return_value="Windows"), \
              unittest.mock.patch.object(desktop, "_try_open_native_app", return_value=None), \
-             unittest.mock.patch.object(desktop.webbrowser, "open", return_value=True) as browser:
+             unittest.mock.patch.object(desktop, "_open_browser_url", side_effect=fake_open):
             result = desktop.route_and_execute("open insta facebook and whatsap")
         self.assertTrue(result["ok"])
         self.assertEqual(len(result["results"]), 3)
         self.assertEqual(
-            [call.args[0] for call in browser.call_args_list],
+            opened,
             ["https://www.instagram.com", "https://www.facebook.com", "https://web.whatsapp.com"],
         )
 
@@ -485,10 +478,12 @@ class DesktopAutomationRoutingTests(unittest.TestCase):
         import eva.automation.desktop as desktop
         with unittest.mock.patch.object(desktop.platform, "system", return_value="Windows"), \
              unittest.mock.patch.object(desktop, "_try_open_native_app", return_value=None), \
-             unittest.mock.patch.object(desktop.webbrowser, "open", return_value=True) as browser:
+             unittest.mock.patch.object(desktop, "_open_browser_url", return_value={
+                 "ok": True, "opened": "https://open.spotify.com", "url": "https://open.spotify.com",
+                 "method": "test_browser", "launch_requested": True}) as browser:
             result = desktop.execute("app_open", "spotify")
         self.assertTrue(result["ok"])
-        browser.assert_called_once_with("https://open.spotify.com", new=2, autoraise=True)
+        browser.assert_called_once_with("https://open.spotify.com")
 
 
 if __name__ == "__main__":
@@ -521,3 +516,64 @@ class MixedAppWebsiteOpeningTests(unittest.TestCase):
     def test_mixed_apps_and_websites_routes_to_desktop_automation(self):
         self.assertEqual(self.router.route("open notepad wikipedia camera google drive").handler,
                          "desktop_automation")
+
+
+class TargetedTypingSafetyTests(unittest.TestCase):
+    def test_multiline_type_prompt_keeps_command_like_body_literal(self):
+        import eva.automation.desktop as desktop
+        seen = []
+        with unittest.mock.patch.object(desktop, "execute",
+                                        side_effect=lambda action, value="": (seen.append((action, value)) or {"ok": True})):
+            result = desktop.route_and_execute("type first line\nopen calculator\nclose this tab")
+        self.assertTrue(result["ok"])
+        self.assertEqual(seen, [("type", "first line\nopen calculator\nclose this tab")])
+
+    def test_notepad_target_is_focused_before_pasting(self):
+        import eva.automation.desktop as desktop
+        events = []
+        with unittest.mock.patch.object(desktop.platform, "system", return_value="Windows"), \
+             unittest.mock.patch.object(desktop, "_focus_notepad_window",
+                                        side_effect=lambda: (events.append("focus") or {"ok": True, "verified": True})), \
+             unittest.mock.patch.object(desktop, "_windows",
+                                        side_effect=lambda action, value="": (events.append((action, value)) or {"ok": True})):
+            result = desktop.execute("type", "safe draft", target="notepad")
+        self.assertTrue(result["ok"])
+        self.assertEqual(events, ["focus", ("type", "safe draft")])
+
+    def test_unfocused_terminal_is_never_sent_a_paste(self):
+        import eva.automation.desktop as desktop
+        with unittest.mock.patch.object(desktop.platform, "system", return_value="Windows"), \
+             unittest.mock.patch.object(desktop, "_foreground_window_details",
+                                        return_value={"title": "EVA - Windows Terminal", "process": "windowsterminal.exe"}), \
+             unittest.mock.patch.object(desktop, "_windows") as windows:
+            result = desktop.execute("type", "this must not reach the terminal")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error_code"], "TERMINAL_FOCUS_BLOCKED")
+        windows.assert_not_called()
+
+    def test_notepad_launch_must_confirm_focus(self):
+        import eva.automation.desktop as desktop
+        with unittest.mock.patch.object(desktop.platform, "system", return_value="Windows"), \
+             unittest.mock.patch.dict(desktop.os.environ, {"WINDIR": r"C:\Windows"}), \
+             unittest.mock.patch.object(desktop.os.path, "isfile", return_value=True), \
+             unittest.mock.patch.object(desktop.shutil, "which", return_value=None), \
+             unittest.mock.patch.object(desktop.subprocess, "Popen"), \
+             unittest.mock.patch.object(desktop, "_focus_notepad_window", return_value={"ok": False, "verified": False, "error_code": "FOCUS_FAILED", "error": "not focused"}):
+            result = desktop._try_open_native_app("notepad")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error_code"], "FOCUS_FAILED")
+        self.assertTrue(result["launch_requested"])
+
+    def test_notepad_launch_reports_focus_as_verified(self):
+        import eva.automation.desktop as desktop
+        with unittest.mock.patch.object(desktop.platform, "system", return_value="Windows"), \
+             unittest.mock.patch.dict(desktop.os.environ, {"WINDIR": r"C:\Windows"}), \
+             unittest.mock.patch.object(desktop.os.path, "isfile", return_value=True), \
+             unittest.mock.patch.object(desktop.shutil, "which", return_value=None), \
+             unittest.mock.patch.object(desktop.subprocess, "Popen"), \
+             unittest.mock.patch.object(desktop, "_focus_notepad_window", return_value={
+                 "ok": True, "verified": True, "window_title": "Untitled - Notepad", "method": "test"
+             }):
+            result = desktop._try_open_native_app("notepad")
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["verified"])

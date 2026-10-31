@@ -1,0 +1,20 @@
+name: zip_folder
+version: 1
+description: Create a ZIP archive from eligible files under a directory.
+inputs:
+  source:
+    type: string
+    minLength: 1
+    maxLength: 4096
+    required: true
+  destination:
+    type: string
+    minLength: 1
+    maxLength: 4096
+    required: true
+steps:
+  - id: create_archive
+    tool: archive.zip_create
+    args:
+      source: "${inputs.source}"
+      destination: "${inputs.destination}"

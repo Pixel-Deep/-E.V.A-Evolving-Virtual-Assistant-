@@ -1,0 +1,20 @@
+name: convert_json_to_csv
+version: 1
+description: Convert an array of JSON objects to a new CSV file.
+inputs:
+  source:
+    type: string
+    minLength: 1
+    maxLength: 4096
+    required: true
+  destination:
+    type: string
+    minLength: 1
+    maxLength: 4096
+    required: true
+steps:
+  - id: convert
+    tool: data.json_to_csv
+    args:
+      source: "${inputs.source}"
+      destination: "${inputs.destination}"

@@ -7,7 +7,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import stat
 from pathlib import Path, PurePosixPath
 from typing import Any
 
@@ -101,9 +103,30 @@ def build_blueprint(spec: dict[str, Any], target: str | Path, *, dry_run: bool =
     raw_spec = dict(spec)
     raw_spec["files"] = [{"path": item["path"], "content": item["content"]} for item in spec.get("files", [])]
     clean = validate_blueprint(raw_spec)
-    dest = Path(target).expanduser().resolve()
+    target_path = Path(target).expanduser()
+    # Check the original target and existing parent components before resolving.
+    try:
+        st = os.lstat(target_path)
+        if stat.S_ISLNK(st.st_mode) or target_path.is_symlink() or os.path.islink(target_path):
+            raise FileExistsError(f"Target cannot be a symbolic link: {target_path}")
+    except FileNotFoundError:
+        pass
+
+    curr = target_path
+    while curr != curr.parent:
+        try:
+            st = os.lstat(curr)
+            if stat.S_ISLNK(st.st_mode) or curr.is_symlink() or os.path.islink(curr):
+                raise FileExistsError(f"Target path or parent cannot be a symbolic link: {curr}")
+        except FileNotFoundError:
+            pass
+        except OSError:
+            pass
+        curr = curr.parent
+
+    dest = target_path.resolve()
     if dest.exists():
-        if dest.is_symlink() or not dest.is_dir() or any(dest.iterdir()):
+        if dest.is_symlink() or os.path.islink(dest) or not dest.is_dir() or any(dest.iterdir()):
             raise FileExistsError("Target must be absent or an empty directory; existing data is never overwritten.")
     if dry_run:
         return {"status": "dry_run", "name": clean["name"], "target": str(dest),

@@ -1,0 +1,20 @@
+name: convert_csv_to_json
+version: 1
+description: Convert a bounded UTF-8 CSV file to a JSON array of objects.
+inputs:
+  source:
+    type: string
+    minLength: 1
+    maxLength: 4096
+    required: true
+  destination:
+    type: string
+    minLength: 1
+    maxLength: 4096
+    required: true
+steps:
+  - id: convert
+    tool: data.csv_to_json
+    args:
+      source: "${inputs.source}"
+      destination: "${inputs.destination}"

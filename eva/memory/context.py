@@ -1,5 +1,9 @@
 
 """Manage EVA's short-term conversation memory."""
+from __future__ import annotations
+
+import json
+from pathlib import Path
 
 
 class ConversationMemory:
@@ -55,3 +59,24 @@ class ConversationMemory:
         """Return the number of stored messages."""
 
         return len(self.messages)
+
+    def save_to_file(self, path: str | Path) -> None:
+        """Persist conversation history to a JSON file."""
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with target.open("w", encoding="utf-8") as f:
+            json.dump(self.messages, f, ensure_ascii=False, indent=2)
+
+    def load_from_file(self, path: str | Path) -> None:
+        """Load conversation history from a JSON file."""
+        source = Path(path)
+        if not source.exists():
+            return
+        with source.open("r", encoding="utf-8") as f:
+            loaded = json.load(f)
+        if isinstance(loaded, list):
+            self.messages = [
+                m for m in loaded
+                if isinstance(m, dict) and m.get("role") in ("user", "assistant") and m.get("content")
+            ]
+            self._limit_history()

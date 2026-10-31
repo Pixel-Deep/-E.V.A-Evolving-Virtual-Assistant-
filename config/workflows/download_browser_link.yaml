@@ -1,0 +1,26 @@
+name: download_browser_link
+version: 1
+description: Click an explicitly selected browser link and save its download into an approved folder. Requires run-scoped approval.
+inputs:
+  url:
+    type: string
+    minLength: 1
+    maxLength: 4096
+    required: true
+  selector:
+    type: string
+    minLength: 1
+    maxLength: 1000
+    required: true
+  path:
+    type: string
+    minLength: 1
+    maxLength: 4096
+    required: true
+steps:
+  - id: download
+    tool: browser.download_link
+    args:
+      url: "${inputs.url}"
+      selector: "${inputs.selector}"
+      path: "${inputs.path}"

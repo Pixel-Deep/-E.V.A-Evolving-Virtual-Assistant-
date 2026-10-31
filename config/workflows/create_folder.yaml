@@ -1,0 +1,14 @@
+name: create_folder
+version: 1
+description: Create a directory within an approved filesystem root.
+inputs:
+  path:
+    type: string
+    minLength: 1
+    maxLength: 4096
+    required: true
+steps:
+  - id: create
+    tool: files.create_directory
+    args:
+      path: "${inputs.path}"

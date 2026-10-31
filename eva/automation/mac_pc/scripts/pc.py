@@ -250,6 +250,12 @@ def brightness_step(direction, steps, dry_run=False):
 
 
 def ip_info(public=False):
+    """Return local interface information without contacting an IP lookup service.
+
+    The legacy ``--public`` flag is retained for command compatibility, but a
+    public-IP lookup requires querying an external endpoint. EVA's no-external-API
+    policy deliberately omits that feature rather than making a hidden request.
+    """
     data = {}
     for iface in ["en0", "en1", "en2"]:
         code, out, _ = run(["ipconfig", "getifaddr", iface])
@@ -260,15 +266,12 @@ def ip_info(public=False):
     if "local" not in data:
         data["local"] = None
     if public:
-        try:
-            req = urllib.request.Request(
-                "https://checkip.amazonaws.com",
-                headers={"User-Agent": "Mozilla/5.0"})
-            data["public"] = urllib.request.urlopen(
-                req, timeout=6).read().decode().strip()
-        except Exception as e:
-            data["public"] = None
-            data["public_error"] = str(e)
+        data["public"] = None
+        data["public_lookup"] = "disabled_no_external_service"
+        data["public_lookup_note"] = (
+            "Public IP lookup is disabled because it requires contacting an external service. "
+            "Only the local interface address is reported."
+        )
     return ok(data)
 
 
@@ -347,6 +350,9 @@ def save_sites(sites):
 def normalize_url(u):
     if not re.match(r"^[a-z]+://", u, re.I):
         u = "https://" + u
+    parsed = urllib.parse.urlparse(u)
+    if parsed.scheme.lower() not in {"http", "https"}:
+        raise ValueError("Only http and https schemes are permitted.")
     return u
 
 
@@ -712,12 +718,16 @@ def doctor():
                                      "this macOS; brightness up/down uses key "
                                      "codes and needs the Accessibility grant")
     checks["ffmpeg"] = bool(shutil.which("ffmpeg"))
+    # Test reachability with an ordinary public website page, not an IP lookup
+    # endpoint or any structured third-party API.
     try:
         req = urllib.request.Request(
-            "https://checkip.amazonaws.com",
-            headers={"User-Agent": "Mozilla/5.0"})
-        urllib.request.urlopen(req, timeout=5)
-        checks["network"] = True
+            "https://example.com/",
+            headers={"User-Agent": "EVA-PC-control/1.0", "Accept": "text/html"})
+        with urllib.request.urlopen(req, timeout=5) as response:
+            content_type = response.headers.get("Content-Type", "")
+            checks["network"] = 200 <= int(response.status) < 400 and (
+                not content_type or "html" in content_type.casefold())
     except Exception:
         checks["network"] = False
     caps_ok = [k for k, v in checks.items() if v is True]

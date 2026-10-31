@@ -1,0 +1,17 @@
+name: find_pdfs
+version: 1
+description: Find PDF files beneath a directory that is within an approved filesystem root.
+inputs:
+  path:
+    type: string
+    minLength: 1
+    maxLength: 4096
+    required: true
+steps:
+  - id: search
+    tool: files.search
+    args:
+      path: "${inputs.path}"
+      pattern: "*.pdf"
+      recursive: true
+      limit: 200

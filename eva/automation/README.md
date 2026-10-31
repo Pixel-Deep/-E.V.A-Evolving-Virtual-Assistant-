@@ -1,92 +1,35 @@
-# EVA Desktop Automation
+# EVA Automation
 
-This integration adds a deterministic desktop-automation route to EVA. The
-language model classifies intent through `eva/core/task_router.py`; actions are
-then mapped to an allow-listed operation in `eva/automation/desktop.py`.
-The model is never allowed to submit arbitrary shell/PowerShell text.
+EVA's automation package has three compatible layers:
 
-## Supported actions
+1. **Compound orchestration** under `eva/automation/orchestration/`: one analyzer, plan builder, and outcome verifier for high-confidence multi-step requests. It uses the same registry and workflow contract as every other plan.
+2. **Typed automation engine** under `eva/automation/engine/`: tool contracts, registry, policy, execution, redacted audit, and deterministic DAG workflows.
+3. **Existing desktop bridge** in `desktop.py`: established allow-listed Windows/macOS operations, retained as a compatibility dispatcher.
 
-| Natural request | Action | Windows | macOS |
-|---|---|---|---|
-| `automation status` | Detect platform and report capabilities | Yes | Yes |
-| `show battery` | Battery percentage/state when hardware exposes it | Yes | Yes |
-| `show system info` | OS, CPU, RAM and host summary | Yes | Basic doctor output |
-| `show network status` / `show IP address` | Local network interfaces, addresses and gateways | Yes | Basic network diagnostic |
-| `show Wi-Fi status` | Wi-Fi SSID/state/signal where exposed | Yes | General diagnostics only |
-| `increase brightness` / `set brightness to 60` | Adjust built-in display brightness when supported | WMI-compatible displays | Yes, when CLI supports it |
-| `check audio devices` | Enumerate installed sound devices; no recording | Yes | Doctor diagnostics |
-| `lock the computer` | Lock current workstation | Yes | Keyboard shortcut; permissions may block it |
-| `open Downloads folder` / `open Documents folder` | Open common user folders | Yes | Depends on app/OS support |
-| `list running apps` | List visible/running applications | Yes | Yes |
-| `open Notepad` / `open Calculator` | Launch application | Yes | Yes |
-| `quit Notepad` | Close matching process/app | Yes | Yes |
-| `open YouTube` / `open example.com` | Open site or search phrase in browser | Yes | Yes |
-| `increase volume`, `volume down`, `mute` | System media keys | Yes | Yes |
-| `set volume to 40`, `volume level` | Exact volume level | Explicitly reports unavailable without an audio backend | Yes, if macOS CLI supports it |
-| `play music`, `next song`, `previous song` | Media transport keys / native media controls | Yes | Yes |
-| `take a screenshot` | Save screen capture | Yes | Yes |
-| `read clipboard`, `copy ... to clipboard` | Clipboard read/write | Yes | Yes |
-| `type hello world` | Type into the focused app | Yes | Yes |
-| `press keys ctrl+t` | Allow-listed keyboard shortcut | Limited allow-list | macOS CLI key map |
-| `speak hello`, `notify hello` | Text-to-speech / notification | Basic Windows speech/dialog | Yes |
+The deterministic request handler resolves known automation intent before the generic chat/coding fallbacks. Analyzed compound requests are planned as one workflow, validated before execution, executed with dependency-aware hand-offs, and checked against the requested outcome. The handler answers registry/help questions from the live registry and will ask for missing input or name an unavailable capability rather than fabricate a result.
 
-## Platform notes
+See [`docs/ORCHESTRATION_REBUILD_REPORT_2026-10-26.md`](../../docs/ORCHESTRATION_REBUILD_REPORT_2026-10-26.md) for the design, test evidence, and limitations. The new date-aware filesystem tools are `files.find_by_date` and `files.copy_with_date`; both remain restricted to approved roots and fail closed on ambiguity.
 
-- The user's observed EVA environment is Windows. This package therefore has a
-  Windows PowerShell backend using Windows APIs and standard Python modules.
-- The provided PC-Automation project is macOS-only. Its CLI and website cache
-  are bundled under `eva/automation/mac_pc/` and used on macOS.
-- Windows exact volume-level control/read is intentionally reported as
-  unavailable rather than falsely claiming success. Volume up/down/mute work
-  via media keys. A future optional Core Audio backend can add exact levels.
-- Screenshots, typing, clipboard, app launch/quit and key presses affect the
-  real desktop. The user should keep the intended app focused and review the
-  target before using them. `app quit` terminates the named process and may
-  discard unsaved work; do not request it unless that is intended.
-- Display brightness via WMI is hardware-dependent and commonly unavailable on external monitors/desktops.
-- Audio-device listing is not the same as microphone capture or a speaker loopback test; those diagnostics are not exposed through EVA's common dispatcher.
-- Network status reports local interfaces only. It does not query or reveal a public IP unless a separate explicit feature is added.
-- Locking the workstation can interrupt active work, so invoke it only when intended.
-- Hardware/permission-specific actions can fail. EVA reports the tool result;
-  it does not claim that a blocked action succeeded.
-- Unsupported operating systems and unsupported shortcuts return a structured
-  error. The integration never falls back to executing arbitrary shell text.
+## Registered tool families
 
-## Try it in EVA
+- **Filesystem:** bounded listing/search, PDF search, create directory/text file, copy/move, SHA-256 duplicate scanning, CSV/JSON conversion.
+- **Archives:** ZIP creation with integrity checking and cache/temp exclusions; safe ZIP extraction.
+- **Browser/web:** controlled Playwright navigation, click/fill/text extraction, headings extraction, screenshots, approval-gated link downloads/file attachment, web search, URL reachability checks, and multi-URL source reports.
+- **Desktop/system:** selected app launch, text-editor launch, clipboard and keyboard operations, basic system/network/time information, and process/resource listing where the host backend supports it.
+- **Windows UI:** available on Windows when `pywinauto` is installed; enumerate/focus windows, inspect accessible controls, click eligible controls with approval, and arrange two uniquely identified windows side by side.
+- **Developer inspection:** read-only Git branch/status/diff summaries and bounded Python source/syntax inventory.
 
-- `automation status`
-- `show battery`
-- `increase volume`
-- `open YouTube`
-- `take a screenshot`
-- `list running apps`
-- `read clipboard`
-- `type hello world`
-- `press keys ctrl+t`
+Each registered tool exposes an input schema and tool metadata. `/tools` lists the current registry; `/tool TOOL_NAME` shows one tool's schema, risk, permissions, dependencies and example. `/workflows` lists installed workflows, and existing workflow preview/run commands remain available.
 
-## Files added/changed
+## Safety and current limitations
 
-- `eva/automation/desktop.py`: OS-aware dispatcher and safe action allow-list.
-- `eva/automation/mac_pc/scripts/pc.py`: bundled macOS automation CLI.
-- `eva/automation/mac_pc/assets/websites.json`: site alias cache.
-- `eva/core/task_router.py`: deterministic desktop intent detection.
-- `eva/core/orchestrator.py`: routes requests to the automation bridge and
-  returns structured results.
-- `tests/automation/test_desktop_automation.py`: routing and safety regression
-  tests.
+- Organization by file type is preview-first; nothing moves until the exact preview is explicitly approved. Destination conflicts are skipped instead of overwritten.
+- Duplicate scans are read-only. They compare file sizes first and SHA-256 hashes for candidate files; no files are deleted.
+- URL checks accept public HTTP/HTTPS targets only and re-check redirects to block private/local destinations. The outbound network must be available.
+- Browser tools use an isolated Playwright Chromium session. User login state is not shared from the normal browser profile. Install Chromium with `python -m playwright install chromium`.
+- Filesystem tools remain confined to configured approved roots and never overwrite existing files.
+- EVA does **not** currently register a restricted project test/build/lint runner, a new-workflow authoring/saving tool, a pending-tasks connector, or an automatic project patch-apply tool. For these prompts it reports the gap; it does not claim to have run commands, changed source, or created a workflow.
+- Windows process metrics and side-by-side tiling require integration testing on a real Windows desktop. Linux smoke tests cannot verify visible Windows UI state. The macOS backend does not currently provide detailed process metrics.
+- The controlled browser/network tools depend on installed Playwright/Chromium and outbound DNS/HTTP access. External results are not fabricated when those dependencies are unavailable.
 
-## Additional integrated automations
-
-The extended dispatcher also recognizes:
-
-- `show system info`: Windows host, OS, CPU, RAM and PowerShell summary.
-- `show network status` / `show IP address`: local active interfaces, IPv4 addresses, gateways and DNS where available.
-- `show Wi-Fi status`: Windows Wi-Fi SSID/state/signal when the WLAN interface exposes it; macOS falls back to system diagnostics.
-- `increase brightness`, `brightness down`, `set brightness to 60`, `brightness level`: WMI-based Windows display control where hardware supports it; macOS uses the bundled brightness CLI.
-- `check audio devices`: Windows sound-device enumeration or macOS diagnostics.
-- `test microphone` / `test speakers`: delegates to the original macOS CLI's audio diagnostics. Windows explicitly reports that recording/loopback tests are not configured instead of claiming success.
-- `lock the computer`: lock workstation on Windows; macOS uses the lock shortcut and may require Accessibility permission.
-- `open Downloads folder`, `open Documents folder`, `open Desktop folder`, `open Pictures folder`, `open Music folder`, `open Videos folder`: open common Windows user folders.
-
-These operations remain hardware-, permission- and OS-dependent. EVA does not claim unsupported actions worked. It does not execute arbitrary model-written shell commands, and destructive actions such as deleting files, installing software, purchasing items, shutting down, or restarting remain blocked pending a proper confirmation/policy flow.
+Read [the architecture and safety guide](../../docs/automation/ARCHITECTURE.md) before adding a tool. Do not introduce unrestricted shell execution or workflows that interpret arbitrary Python or shell text.

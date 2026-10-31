@@ -1,0 +1,21 @@
+name: read_webpage
+version: 1
+description: Open a page in EVA's isolated controlled Chromium session and extract a bounded amount of visible text.
+inputs:
+  url:
+    type: string
+    minLength: 1
+    maxLength: 4096
+    required: true
+steps:
+  - id: navigate
+    tool: browser.navigate
+    args:
+      url: "${inputs.url}"
+  - id: extract
+    tool: browser.text
+    depends_on:
+      - navigate
+    args:
+      selector: body
+      max_chars: 12000

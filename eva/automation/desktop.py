@@ -7,7 +7,11 @@ shell commands are never accepted from the model.
 from __future__ import annotations
 
 import base64
+import ast
+import ctypes
 import json
+import math
+import operator
 import os
 import platform
 import re
@@ -17,28 +21,54 @@ import sys
 import time
 import webbrowser
 from pathlib import Path
-from urllib.parse import quote, quote_plus, urlencode
-from urllib.request import Request, urlopen
-from urllib.error import HTTPError, URLError
+from urllib.parse import quote, quote_plus
 
 AUTOMATION_DIR = Path(__file__).resolve().parent
 MAC_PC = AUTOMATION_DIR / "mac_pc" / "scripts" / "pc.py"
 
 
-def _ps(script: str, timeout: int = 15):
+def _kill_process_tree(pid: int) -> None:
+    """Terminate a process and all its child processes on Windows."""
+    if platform.system().lower() == "windows":
+        try:
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(pid)],
+                capture_output=True, timeout=5,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except Exception:
+            pass
+
+
+def _ps(script: str, timeout: int = 15, context: Any = None):
     encoded = base64.b64encode(script.encode("utf-16le")).decode("ascii")
+    proc = None
     try:
-        p = subprocess.run(
+        proc = subprocess.Popen(
             ["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive",
              "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded],
-            capture_output=True, text=True, timeout=timeout,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+        if context is not None and hasattr(context, "register_process"):
+            context.register_process(proc)
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        if proc is not None:
+            _kill_process_tree(proc.pid)
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        return {"ok": False, "error": f"PowerShell command timed out after {timeout} seconds.", "timeout": True}
+    except OSError as exc:
         return {"ok": False, "error": str(exc)}
-    stdout = p.stdout.strip()
-    if p.returncode:
-        return {"ok": False, "error": p.stderr.strip() or stdout or "PowerShell command failed"}
+    finally:
+        if proc is not None and context is not None and hasattr(context, "unregister_process"):
+            context.unregister_process(proc)
+    stdout = stdout.strip()
+    if proc.returncode:
+        return {"ok": False, "error": stderr.strip() or stdout or "PowerShell command failed"}
     try:
         parsed = json.loads(stdout) if stdout else {}
         if isinstance(parsed, dict):
@@ -49,7 +79,7 @@ def _ps(script: str, timeout: int = 15):
         return {"ok": True, "result": stdout}
 
 
-def _windows(action: str, value: str = ""):
+def _windows(action: str, value: str = "", *, target: str | None = None, context: Any = None):
     # PowerShell literals are single-quoted, with embedded apostrophes doubled.
     v = "'" + value.replace("'", "''") + "'"
     if action == "doctor":
@@ -123,6 +153,16 @@ Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; pu
 """
     elif action == "apps":
         script = r"""[pscustomobject]@{ok=$true;apps=@(Get-Process | Where-Object {$_.MainWindowTitle} | Select-Object -ExpandProperty ProcessName -Unique | Sort-Object)}|ConvertTo-Json -Compress"""
+    elif action == "processes":
+        script = r"""
+$ErrorActionPreference='Stop'
+try {
+  $items = @(Get-Process | Sort-Object WorkingSet64 -Descending | Select-Object -First 500 | ForEach-Object {
+    [pscustomobject]@{name=$_.ProcessName;pid=$_.Id;cpu_seconds=if($null -ne $_.CPU){[math]::Round($_.CPU,2)}else{$null};working_set_bytes=$_.WorkingSet64;memory_mb=[math]::Round($_.WorkingSet64/1MB,1);handles=$_.Handles;responding=if($_.Responding -is [bool]){$_.Responding}else{$null}}
+  })
+  [pscustomobject]@{ok=$true;processes=$items;count=$items.Count;truncated=((Get-Process).Count -gt 500)} | ConvertTo-Json -Depth 4 -Compress
+} catch { [pscustomobject]@{ok=$false;error=$_.Exception.Message}|ConvertTo-Json -Compress }
+"""
     elif action == "app_front":
         script = r"""Add-Type -AssemblyName Microsoft.VisualBasic; [pscustomobject]@{ok=$true;message='Windows does not reliably expose the foreground app name through the standard library.';available=$false}|ConvertTo-Json -Compress"""
     elif action == "app_open":
@@ -140,8 +180,14 @@ Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; pu
             script = f"""
 $ErrorActionPreference = 'Stop'
 try {{
-  $dest = [Environment]::GetFolderPath({qknown})
-  if (-not $dest) {{ $dest = Join-Path $env:USERPROFILE {qknown} }}
+  if ({qknown} -eq 'Downloads') {{
+    $shell = New-Object -ComObject Shell.Application
+    $downloads = $shell.Namespace('shell:Downloads')
+    $dest = if ($downloads -and $downloads.Self) {{ $downloads.Self.Path }} else {{ Join-Path $env:USERPROFILE 'Downloads' }}
+  }} else {{
+    $dest = [Environment]::GetFolderPath({qknown})
+    if (-not $dest) {{ $dest = Join-Path $env:USERPROFILE {qknown} }}
+  }}
   if (-not (Test-Path -LiteralPath $dest)) {{ throw 'Requested folder was not found.' }}
   Start-Process -FilePath 'explorer.exe' -ArgumentList @($dest) -ErrorAction Stop
   [pscustomobject]@{{ok=$true;opened=$dest;launch_requested=$true}} | ConvertTo-Json -Compress
@@ -163,7 +209,15 @@ try {{
         q = "'" + safe.replace("'", "''") + "'"
         script = f"""$p=Get-Process -Name {q} -ErrorAction SilentlyContinue; if($p){{$p | Stop-Process -ErrorAction Stop; [pscustomobject]@{{ok=$true;closed={q}}}|ConvertTo-Json -Compress}}else{{[pscustomobject]@{{ok=$true;running=$false;message='Process not found'}}|ConvertTo-Json -Compress}}"""
     elif action == "screenshot":
-        path = value or str(Path.home() / "Pictures" / "EVA-screenshot.png")
+        path_obj = Path(value.strip()).expanduser().resolve(strict=False) if value and value.strip() else (Path.home() / "Pictures" / "EVA-screenshot.png").resolve(strict=False)
+        try:
+            from eva.automation.engine.policy import AutomationPolicy
+            policy = AutomationPolicy.load_default()
+            if not policy.is_path_allowed(path_obj):
+                return {"ok": False, "error": f"Screenshot destination is outside allowed automation roots: {path_obj}"}
+        except Exception:
+            pass
+        path = str(path_obj)
         pv = "'" + path.replace("'", "''") + "'"
         script = f"""
 Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing
@@ -177,12 +231,69 @@ $bmp.Save($dest,[System.Drawing.Imaging.ImageFormat]::Png); $g.Dispose(); $bmp.D
     elif action == "clipboard_get":
         script = r"""Add-Type -AssemblyName System.Windows.Forms; [pscustomobject]@{ok=$true;text=[System.Windows.Forms.Clipboard]::GetText()}|ConvertTo-Json -Compress"""
     elif action == "clipboard_set":
-        script = f"""Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.Clipboard]::SetText({v}); [pscustomobject]@{{ok=$true;characters={len(value)}}}|ConvertTo-Json -Compress"""
+        script = f"""Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.Clipboard]::SetText({v}); $readback = [System.Windows.Forms.Clipboard]::GetText(); $ver = ($readback -eq {v}); [pscustomobject]@{{ok=$true;characters={len(value)};verified=$ver;value=$readback}}|ConvertTo-Json -Compress"""
     elif action == "type":
-        # SendKeys has special characters; escape the most important ones.
-        escaped = value.replace("{", "{{}").replace("}", "{}}").replace("+", "{+}").replace("^", "{^}").replace("%", "{%}").replace("~", "{~}").replace("(", "{(}").replace(")", "{)}")
-        ev = "'" + escaped.replace("'", "''") + "'"
-        script = f"""Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait({ev}); [pscustomobject]@{{ok=$true;typed_characters={len(value)}}}|ConvertTo-Json -Compress"""
+        # SendKeys text is fragile for Unicode and multi-line content. Paste the
+        # exact Unicode string instead, then report dispatch honestly. The tool
+        # contract declares clipboard.write because this briefly replaces it.
+        # The prior clipboard contents are saved and restored after the paste so
+        # that repeated calls or subsequent clipboard reads are not surprised by
+        # EVA's transient payload. Restoration is best-effort: if SetText fails
+        # (e.g. protected clipboard), the paste already completed successfully.
+        encoded_text = base64.b64encode(value.encode("utf-8")).decode("ascii")
+        target_proc = "notepad" if (target and "notepad" in target.lower()) else ""
+        script = f"""
+$ErrorActionPreference = 'Stop'
+try {{
+  Add-Type -AssemblyName System.Windows.Forms
+  Add-Type @"
+    using System;
+    using System.Runtime.InteropServices;
+    public class WinUtilFocus {{
+      [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+      [DllImport("user32.dll", SetLastError = true)] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+    }}
+"@
+  $fgHwnd = [WinUtilFocus]::GetForegroundWindow()
+  $pidVal = [uint32]0
+  [WinUtilFocus]::GetWindowThreadProcessId($fgHwnd, [ref]$pidVal) | Out-Null
+  $fgProc = ''
+  if ($pidVal -gt 0) {{
+    $p = Get-Process -Id $pidVal -ErrorAction SilentlyContinue
+    if ($p) {{ $fgProc = $p.ProcessName.ToLower() }}
+  }}
+  $targetProc = '{target_proc}'.ToLower()
+  if ($targetProc -ne '' -and $fgProc -ne '' -and $fgProc -ne $targetProc) {{
+    [pscustomobject]@{{ok=$false;error="Focus was lost: target window was '$targetProc', but active window is '$fgProc'. Text paste aborted to prevent wrong-window entry.";error_code='FOCUS_LOST_BEFORE_TYPE';verified=$false}} | ConvertTo-Json -Compress
+    exit
+  }}
+  $terminals = @('cmd','powershell','pwsh','windowsterminal','conhost','openconsole')
+  if ($terminals -contains $fgProc) {{
+    [pscustomobject]@{{ok=$false;error="Terminal window '$fgProc' is currently focused. Text paste aborted for safety.";error_code='TERMINAL_FOCUS_BLOCKED';verified=$false}} | ConvertTo-Json -Compress
+    exit
+  }}
+
+  $text = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{encoded_text}'))
+  $prior = ''
+  try {{ $prior = [System.Windows.Forms.Clipboard]::GetText() }} catch {{}}
+  [System.Windows.Forms.Clipboard]::SetText($text)
+  Start-Sleep -Milliseconds 80
+  [System.Windows.Forms.SendKeys]::SendWait('^v')
+  Start-Sleep -Milliseconds 60
+  $restored = $false
+  try {{
+    if ($prior -ne '') {{ [System.Windows.Forms.Clipboard]::SetText($prior) }} else {{ [System.Windows.Forms.Clipboard]::Clear() }}
+    $restored = $true
+  }} catch {{}}
+  $msg = 'Paste shortcut dispatched; visible text was not independently read back.'
+  if (-not $restored) {{
+    $msg = 'Paste shortcut dispatched, but prior clipboard contents could not be restored.'
+  }}
+  [pscustomobject]@{{ok=$true;typed_characters={len(value)};method='unicode_clipboard_paste';clipboard_replaced=$true;clipboard_restored=$restored;verified=$false;message=$msg}} | ConvertTo-Json -Compress
+}} catch {{
+  [pscustomobject]@{{ok=$false;error=$_.Exception.Message;method='unicode_clipboard_paste';verified=$false}} | ConvertTo-Json -Compress
+}}
+"""
     elif action == "web":
         # Keep this branch safe even if called directly; execute() normally
         # intercepts Windows web actions and uses the cross-platform browser API.
@@ -215,7 +326,7 @@ $bmp.Save($dest,[System.Drawing.Imaging.ImageFormat]::Png); $g.Dispose(); $bmp.D
         script = f"""Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.SendKeys]::SendWait({ev}); [pscustomobject]@{{ok=$true;sent={v}}}|ConvertTo-Json -Compress"""
     else:
         return {"ok": False, "error": f"Unsupported Windows automation action: {action}"}
-    return _ps(script, timeout=30)
+    return _ps(script, timeout=30, context=context)
 
 
 
@@ -245,8 +356,25 @@ def _create_file(request: str):
         name += extension
     folder = Path.home() / "Documents" / "EVA-created-files"
     try:
+        from eva.automation.engine.policy import AutomationPolicy
+        policy = AutomationPolicy.load_default()
+        if policy.allowed_roots:
+            for candidate in policy.allowed_roots:
+                if candidate.exists() and candidate.is_dir():
+                    folder = candidate / "EVA-created-files"
+                    break
+    except Exception:
+        pass
+    try:
         folder.mkdir(parents=True, exist_ok=True)
         destination = folder / name
+        try:
+            from eva.automation.engine.policy import AutomationPolicy
+            policy = AutomationPolicy.load_default()
+            if not policy.is_path_allowed(destination):
+                return {"ok": False, "error": f"Path is outside allowed automation roots: {destination}"}
+        except Exception:
+            pass
         with destination.open("x", encoding="utf-8") as handle:
             handle.write("")
         return {"ok": True, "path": str(destination), "created": True}
@@ -256,17 +384,429 @@ def _create_file(request: str):
         return {"ok": False, "error": f"Could not create file: {exc}"}
 
 
-def _public_ip():
-    """Fetch the public IP with a short timeout and no third-party dependency."""
+def _foreground_window_details() -> dict[str, str]:
+    """Return the foreground window title and owning executable name."""
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+    user32.GetForegroundWindow.restype = ctypes.c_void_p
+    user32.GetWindowThreadProcessId.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong)]
+    user32.GetWindowTextW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_int]
+    kernel32.OpenProcess.argtypes = [ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.QueryFullProcessImageNameW.argtypes = [
+        ctypes.c_void_p, ctypes.c_ulong, ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_ulong)
+    ]
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    hwnd = user32.GetForegroundWindow()
+    if not hwnd:
+        return {"title": "", "process": ""}
+    title_buffer = ctypes.create_unicode_buffer(512)
+    user32.GetWindowTextW(hwnd, title_buffer, len(title_buffer))
+    process_id = ctypes.c_ulong()
+    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(process_id))
+    process_handle = kernel32.OpenProcess(0x1000, False, process_id.value)
+    process_name = ""
+    if process_handle:
+        try:
+            image_buffer = ctypes.create_unicode_buffer(32768)
+            image_size = ctypes.c_ulong(len(image_buffer))
+            if kernel32.QueryFullProcessImageNameW(
+                process_handle, 0, image_buffer, ctypes.byref(image_size)
+            ):
+                process_name = Path(image_buffer.value).name.casefold()
+        finally:
+            kernel32.CloseHandle(process_handle)
+    return {"title": title_buffer.value, "process": process_name}
+
+
+def _focus_notepad_window(timeout: float = 8.0) -> dict[str, object]:
+    """Focus the Notepad window and verify that Notepad owns the foreground."""
     try:
-        with urlopen("https://api64.ipify.org?format=json", timeout=4) as response:
-            data = json.loads(response.read().decode("utf-8"))
-        address = data.get("ip")
-        if not address:
-            return {"ok": False, "error": "Public IP service returned no address."}
-        return {"ok": True, "public_ip": address}
+        from pywinauto import Desktop
+    except ImportError as exc:
+        return {"ok": False, "error_code": "DEPENDENCY_MISSING",
+                "error": f"Notepad focus needs pywinauto: {exc}"}
+
+    deadline = time.monotonic() + timeout
+    last_error = None
+    while time.monotonic() < deadline:
+        try:
+            windows = [
+                window for window in Desktop(backend="win32").windows(visible_only=True)
+                if ("notepad" in (window.window_text() or "").casefold()
+                    and "hook" not in (window.class_name() or "").casefold())
+            ]
+            for window in windows:
+                try:
+                    window.restore()
+                except Exception:
+                    pass
+                try:
+                    window.set_keyboard_focus()
+                except Exception:
+                    pass
+                try:
+                    hwnd = getattr(window, "handle", None)
+                    if hwnd:
+                        ctypes.windll.user32.SetForegroundWindow(hwnd)
+                except Exception:
+                    pass
+                try:
+                    window.set_focus()
+                except Exception as exc:
+                    last_error = str(exc)
+                time.sleep(0.12)
+                try:
+                    foreground = _foreground_window_details()
+                    if "notepad" in foreground.get("title", "").casefold() or foreground.get("process") == "notepad.exe":
+                        return {"ok": True, "verified": True,
+                                "window_title": window.window_text(),
+                                "method": "pywinauto_window_focus"}
+                except Exception as exc:
+                    last_error = str(exc)
+        except Exception as exc:
+            last_error = str(exc)
+        time.sleep(0.15)
+    window_found = bool(windows) if 'windows' in locals() and windows else False
+    return {"ok": False, "verified": False, "error_code": "FOCUS_FAILED",
+            "window_found": window_found,
+            "error": "EVA could not verify that Notepad is the foreground window; no text was pasted."
+                    + (f" ({last_error})" if last_error else "")}
+
+
+def _new_notepad_document() -> dict[str, object]:
+    """Create a new blank Notepad tab without altering the existing document.
+
+    The key sequence is sent through pywinauto to the verified Notepad window,
+    rather than starting a separate PowerShell process which might steal focus.
+    If a Save/Save As dialog appears, fail closed so later text is never pasted
+    into a modal dialog.
+    """
+    if platform.system().lower() != "windows":
+        return {"ok": False, "verified": False, "error_code": "UNSUPPORTED_PLATFORM",
+                "error": "Creating a fresh Notepad document is supported only on Windows."}
+    try:
+        from pywinauto import Desktop
+    except ImportError as exc:
+        return {"ok": False, "verified": False, "error_code": "DEPENDENCY_MISSING",
+                "error": f"A fresh Notepad document needs pywinauto: {exc}"}
+
+    focus = _focus_notepad_window()
+    if not focus.get("ok"):
+        return focus
+    try:
+        windows = [window for window in Desktop(backend="win32").windows(visible_only=True)
+                   if "notepad" in (window.window_text() or "").casefold()]
+        preferred_title = str(focus.get("window_title", "")).casefold()
+        windows.sort(key=lambda window: 0 if (window.window_text() or "").casefold() == preferred_title else 1)
+        if not windows:
+            return {"ok": False, "verified": False, "error_code": "NOTEPAD_WINDOW_MISSING",
+                    "error": "Notepad's window disappeared before a new document could be opened."}
+        target = windows[0]
+        try:
+            target.restore()
+        except Exception:
+            pass
+        try:
+            target.set_keyboard_focus()
+        except Exception:
+            pass
+        try:
+            hwnd = getattr(target, "handle", None)
+            if hwnd:
+                ctypes.windll.user32.SetForegroundWindow(hwnd)
+        except Exception:
+            pass
+        try:
+            target.set_focus()
+        except Exception:
+            pass
+        time.sleep(0.1)
+        foreground = _foreground_window_details()
+        if "notepad" not in foreground.get("title", "").casefold() and foreground.get("process", "") != "notepad.exe":
+            if foreground.get("title") or foreground.get("process"):
+                return {"ok": False, "verified": False, "error_code": "FOCUS_FAILED",
+                        "error": "Notepad is not foreground; no new document was requested."}
+        target.type_keys("^n", set_foreground=True)
+        time.sleep(0.25)
+        current = _foreground_window_details()
+        current_title = current.get("title", "")
+        if re.search(r"\b(?:save|save as|save changes)\b", current_title, re.I):
+            return {"ok": False, "verified": False, "error_code": "NOTEPAD_SAVE_DIALOG",
+                    "error": "Notepad displayed a save dialog. EVA did not paste text into it; resolve the dialog and retry."}
+        if "notepad" not in current_title.casefold() and current.get("process", "") != "notepad.exe":
+            return {"ok": False, "verified": False, "error_code": "NOTEPAD_FOCUS_LOST",
+                    "error": "The new-document shortcut was sent, but Notepad is no longer foreground; text entry was stopped."}
+        blank_check = _verify_notepad_text("", timeout=1.0)
+        if not blank_check.get("verified"):
+            return {"ok": False, "verified": False, "error_code": "NOTEPAD_NEW_DOCUMENT_UNVERIFIED",
+                    "method": "notepad_focused_ctrl_n",
+                    "error": "Ctrl+N was dispatched to Notepad, but EVA could not independently verify a blank document. Text entry was stopped to avoid appending into an existing note."}
+        return {"ok": True, "verified": True, "method": "notepad_focused_ctrl_n",
+                "message": "A blank Notepad document was read back before any new content was entered."}
     except Exception as exc:
-        return {"ok": False, "error": f"Could not determine public IP: {type(exc).__name__}: {exc}"}
+        return {"ok": False, "verified": False, "error_code": "NOTEPAD_NEW_DOCUMENT_FAILED",
+                "error": f"Could not create a new Notepad document ({type(exc).__name__}). No text was pasted."}
+
+
+def _verify_notepad_text(expected: str, timeout: float = 1.8) -> dict[str, object]:
+    """Best-effort UI Automation read-back of the Notepad document text.
+
+    A successful paste dispatch is not proof of document contents. This helper
+    reads the accessible Document/Edit value when Windows exposes it; callers
+    must preserve an explicit unverified result when the control is unavailable.
+    """
+    try:
+        from pywinauto import Desktop
+    except ImportError as exc:
+        return {"readable": False, "verified": False,
+                "message": f"Notepad text read-back requires pywinauto: {exc}"}
+
+    def normalize(value: str) -> str:
+        return value.replace("\r\n", "\n").replace("\r", "\n").rstrip("\n")
+
+    wanted = normalize(expected)
+    deadline = time.monotonic() + max(0.1, timeout)
+    saw_readable_control = False
+    last_value = ""
+    last_error = None
+    while time.monotonic() < deadline:
+        try:
+            windows = [window for window in Desktop(backend="uia").windows(visible_only=True)
+                       if "notepad" in (window.window_text() or "").casefold()]
+            for window in windows:
+                try:
+                    controls = window.descendants()
+                except Exception as exc:
+                    last_error = str(exc)
+                    continue
+                for control in controls:
+                    try:
+                        control_type = str(getattr(control.element_info, "control_type", ""))
+                    except Exception:
+                        control_type = ""
+                    if control_type not in {"Document", "Edit"}:
+                        continue
+                    candidates: list[str] = []
+                    try:
+                        getter = getattr(control, "get_value", None)
+                        if callable(getter):
+                            candidates.append(str(getter() or ""))
+                    except Exception as exc:
+                        last_error = str(exc)
+                    try:
+                        iface_value = getattr(control, "iface_value", None)
+                        if iface_value is not None:
+                            candidates.append(str(iface_value.CurrentValue or ""))
+                    except Exception as exc:
+                        last_error = str(exc)
+                    try:
+                        iface_text = getattr(control, "iface_text", None)
+                        if iface_text is not None:
+                            text_pattern = getattr(iface_text, "DocumentRange", None)
+                            if text_pattern is not None:
+                                candidates.append(str(text_pattern.GetText(-1) or ""))
+                    except Exception as exc:
+                        last_error = str(exc)
+                    try:
+                        candidates.append(str(control.window_text() or ""))
+                    except Exception as exc:
+                        last_error = str(exc)
+                    # Prefer the fullest candidate to avoid accepting a title or
+                    # partial accessible fragment when the control exposes both.
+                    candidates = sorted(set(candidates), key=len, reverse=True)
+                    for candidate in candidates:
+                        if not candidate and not wanted:
+                            saw_readable_control = True
+                            return {"readable": True, "verified": True, "characters": 0,
+                                    "message": "Notepad's accessible document is empty as expected."}
+                        if candidate:
+                            saw_readable_control = True
+                            last_value = candidate
+                            if normalize(candidate) == wanted:
+                                return {"readable": True, "verified": True, "characters": len(candidate),
+                                        "message": "Notepad document text was read back and exactly matched the requested text."}
+        except Exception as exc:
+            last_error = str(exc)
+        time.sleep(0.12)
+
+    if saw_readable_control:
+        return {"readable": True, "verified": False, "characters": len(last_value),
+                "message": "Notepad's accessible document text did not exactly match the requested text; the paste result is not accepted as verified."}
+    return {"readable": False, "verified": False,
+            "message": "Paste was dispatched, but Windows did not expose readable Notepad document text for independent verification."
+                    + (f" ({last_error})" if last_error else "")}
+
+
+def calculate_in_windows_calculator(expression: str) -> dict[str, object]:
+    """Enter arithmetic into Windows Calculator and verify its accessible display.
+
+    Prefer Calculator UIA buttons; if an OS build exposes different automation
+    IDs, fall back to keystrokes only after the Calculator window is confirmed as
+    the foreground window. The function never treats EVA's independent math
+    result alone as proof that the UI calculation succeeded.
+    """
+    normalized = expression.strip().rstrip(".!? ")
+    normalized = re.sub(r"\b(?:calculate|calulate|what is|compute|evaluate)\b", "", normalized, flags=re.I)
+    word_ops = ((r"\bmultiplied\s+by\b|\btimes\b|\bmultiplied\b", "*"),
+                (r"\bdivided\s+by\b|\bdivide(?:d)?\s+by\b", "/"),
+                (r"\bplus\b|\badd(?:ed)?\b", "+"),
+                (r"\bminus\b|\bsubtract(?:ed)?\b", "-"))
+    for pattern, symbol in word_ops:
+        normalized = re.sub(pattern, symbol, normalized, flags=re.I)
+    normalized = re.sub(r"\b(?:and|then)\b", " ", normalized, flags=re.I)
+    normalized = re.sub(r"(?i)(?<=\d)\s*[x×]\s*(?=\d)", "*", normalized)
+    normalized = normalized.replace("×", "*").replace("÷", "/")
+    normalized = re.sub(r"\s+", "", normalized)
+    try:
+        tree = ast.parse(normalized, mode="eval").body
+        binary_ops = {ast.Add: operator.add, ast.Sub: operator.sub,
+                      ast.Mult: operator.mul, ast.Div: operator.truediv}
+
+        def evaluate(node):
+            if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)) and not isinstance(node.value, bool):
+                return float(node.value)
+            if isinstance(node, ast.BinOp) and type(node.op) in binary_ops:
+                return binary_ops[type(node.op)](evaluate(node.left), evaluate(node.right))
+            raise ValueError("Only numeric addition, subtraction, multiplication, and division are supported.")
+
+        expected_value = evaluate(tree)
+        if not math.isfinite(expected_value):
+            raise ValueError("The result is not finite.")
+        tokens = re.findall(r"\d+(?:\.\d+)?|[+*/-]", normalized)
+        if not tokens or "".join(tokens) != normalized or len(tokens) % 2 != 1:
+            raise ValueError("Use a simple sequence of numbers and +, -, *, or / operators.")
+        if any(tokens[index] not in {"+", "-", "*", "/"} for index in range(1, len(tokens), 2)):
+            raise ValueError("The expression contains an unsupported operator sequence.")
+        if any(tokens[index] == "/" and float(tokens[index + 1]) == 0 for index in range(1, len(tokens), 2)):
+            raise ValueError("Division by zero is not supported.")
+        if any(tokens[index] in {"*", "/"} for index in range(1, len(tokens), 2)) and any(tokens[index] in {"+", "-"} for index in range(1, len(tokens), 2)):
+            raise ValueError("Windows Calculator Standard mode calculates left-to-right without operator precedence (e.g. 2+3*4 evaluates as 20 instead of 14). Combine operations of one precedence at a time in Calculator, or use EVA's math engine for full PEMDAS evaluation.")
+        if len(tokens) > 11:
+            raise ValueError("The Calculator entry is limited to six numbers per expression.")
+    except (SyntaxError, ValueError, ZeroDivisionError, OverflowError) as exc:
+        return {"ok": False, "verified": False, "error_code": "UNSUPPORTED_EXPRESSION",
+                "error": str(exc) or "The expression is not supported."}
+
+    expected = str(int(expected_value)) if expected_value.is_integer() else f"{expected_value:.12g}"
+
+    def display_text(calculator_window) -> str:
+        pieces: list[str] = []
+        try:
+            result_control = calculator_window.child_window(auto_id="CalculatorResults", control_type="Text")
+            for getter in (lambda: result_control.window_text(),
+                           lambda: result_control.element_info.name,
+                           lambda: result_control.iface_text.CurrentName):
+                try:
+                    value = str(getter() or "").strip()
+                    if value and value not in pieces:
+                        pieces.append(value)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        # Windows Calculator's accessible result AutomationId is stable on most
+        # builds, but its text control type/name varies on some Windows versions.
+        if not pieces:
+            try:
+                for control in calculator_window.descendants(control_type="Text"):
+                    for getter in (lambda c=control: c.window_text(),
+                                   lambda c=control: c.element_info.name):
+                        try:
+                            value = str(getter() or "").strip()
+                            if value and value not in pieces:
+                                pieces.append(value)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+        return " | ".join(pieces)
+
+    def display_matches(label: str) -> bool:
+        if not label:
+            return False
+        # Prefer the last numeric value in accessible display strings such as
+        # "Display is 105", "105", or grouped values like "1,024".
+        matches = re.findall(r"(?<![A-Za-z])[-+]?\d[\d,]*(?:\.\d+)?", label)
+        if not matches:
+            return False
+        try:
+            displayed = float(matches[-1].replace(",", ""))
+            return math.isclose(displayed, expected_value, rel_tol=1e-10, abs_tol=1e-10)
+        except (ValueError, OverflowError):
+            return False
+
+    try:
+        from pywinauto import Desktop, keyboard
+        calculator = Desktop(backend="uia").window(title_re=r"(?i).*calculator.*")
+        calculator.wait("exists visible enabled", timeout=6)
+        calculator.set_focus()
+        time.sleep(0.18)
+        foreground = _foreground_window_details()
+        if not ("calculator" in foreground.get("title", "").casefold()
+                or "calculator" in foreground.get("process", "").casefold()):
+            return {"ok": False, "verified": False, "error_code": "CALCULATOR_FOCUS_FAILED",
+                    "expected": expected,
+                    "foreground_title": foreground.get("title", ""),
+                    "error": "EVA could not confirm Calculator was the foreground window; no calculation was entered."}
+
+        button_error = ""
+        method = "calculator_uia_buttons"
+        try:
+            def press(auto_id: str) -> None:
+                calculator.child_window(auto_id=auto_id, control_type="Button").invoke()
+
+            digits = {str(i): f"num{i}Button" for i in range(10)}
+            op_buttons = {"+": "plusButton", "-": "minusButton",
+                          "*": "multiplyButton", "/": "divideButton"}
+            press("clearButton")
+            for index, token in enumerate(tokens):
+                if index % 2:
+                    press(op_buttons[token])
+                else:
+                    for character in token:
+                        press("decimalSeparatorButton" if character == "." else digits[character])
+            press("equalButton")
+        except Exception as exc:
+            button_error = f"{type(exc).__name__}: {exc}"[:240]
+            method = "calculator_keyboard_fallback"
+            try:
+                # The foreground check above is mandatory before any keystroke.
+                # Escape clears a partially entered expression if the button path
+                # failed midway. Escape each arithmetic character as a named key
+                # where pywinauto uses modifier syntax for punctuation.
+                keyboard.send_keys("{ESC}", pause=0.02)
+                key_ops = {"+": "{ADD}", "-": "{SUBTRACT}", "*": "{MULTIPLY}", "/": "{DIVIDE}"}
+                for index, token in enumerate(tokens):
+                    if index % 2:
+                        keyboard.send_keys(key_ops[token], pause=0.025)
+                    else:
+                        for character in token:
+                            keyboard.send_keys(character, pause=0.015)
+                keyboard.send_keys("{ENTER}", pause=0.02)
+            except Exception as fallback_exc:
+                return {"ok": False, "verified": False, "error_code": "CALCULATOR_UI_UNAVAILABLE",
+                        "expected": expected, "method": method,
+                        "button_path_error": button_error,
+                        "error": f"Calculator UI buttons and keyboard fallback both failed: {type(fallback_exc).__name__}: {fallback_exc}"[:500]}
+
+        deadline = time.monotonic() + 4.0
+        label = ""
+        while time.monotonic() < deadline:
+            label = display_text(calculator)
+            if display_matches(label):
+                return {"ok": True, "verified": True, "expression": normalized,
+                        "display": label, "result": expected, "method": method,
+                        **({"button_path_error": button_error} if button_error else {})}
+            time.sleep(0.12)
+        return {"ok": False, "verified": False, "error_code": "CALCULATOR_RESULT_MISMATCH",
+                "expression": normalized, "display": label, "expected": expected, "method": method,
+                **({"button_path_error": button_error} if button_error else {}),
+                "error": "Calculator's visible result could not be matched to the independently computed result."}
+    except Exception as exc:
+        return {"ok": False, "verified": False, "error_code": "CALCULATOR_UI_UNAVAILABLE",
+                "expected": expected,
+                "error": f"Calculator could not be operated through its accessible controls: {type(exc).__name__}: {exc}"}
 
 
 def _try_open_native_app(target: str):
@@ -288,6 +828,7 @@ def _try_open_native_app(target: str):
         "notepad": {"display": ["Notepad"], "executables": ["notepad.exe"], "protocol": ""},
         "camera": {"display": ["Camera", "Windows Camera"], "executables": ["WindowsCamera.exe"], "protocol": "microsoft.windows.camera"},
         "calculator": {"display": ["Calculator", "Windows Calculator"], "executables": ["calc.exe"], "protocol": "calculator"},
+        "paint": {"display": ["Paint", "Microsoft Paint"], "executables": ["mspaint.exe"], "protocol": ""},
         "chrome": {"display": ["Google Chrome", "Chrome"], "executables": ["chrome.exe"], "protocol": ""},
         "google chrome": {"display": ["Google Chrome", "Chrome"], "executables": ["chrome.exe"], "protocol": ""},
         "edge": {"display": ["Microsoft Edge", "Edge"], "executables": ["msedge.exe"], "protocol": ""},
@@ -309,6 +850,52 @@ def _try_open_native_app(target: str):
 
     system = platform.system().lower()
     if system == "windows":
+        # Notepad, Calculator, and Paint can be launched through their native
+        # executable paths instead of PowerShell/Start-Process. This avoids
+        # provider-drive failures in inherited shell contexts for core Windows apps.
+        # Notepad's WindowsApps execution alias is intentionally bypassed.
+        if key in {"notepad", "calculator", "paint"}:
+            windir = os.environ.get("WINDIR", r"C:\Windows")
+            system32 = os.path.join(windir, "System32")
+            executable = {"notepad": "notepad.exe", "calculator": "calc.exe", "paint": "mspaint.exe"}[key]
+            candidates = [os.path.join(system32, executable)]
+            located = shutil.which(executable)
+            if located:
+                candidates.append(located)
+            tried = []
+            for candidate in dict.fromkeys(candidates):
+                if not os.path.isfile(candidate):
+                    continue
+                try:
+                    subprocess.Popen([candidate], stdin=subprocess.DEVNULL,
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                     close_fds=True,
+                                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                    display_name = {"notepad": "Notepad", "calculator": "Calculator", "paint": "Paint"}[key]
+                    result = {"ok": True, "opened": display_name,
+                              "method": "native_process_launch", "launch_requested": True,
+                              "verified": False, "path": candidate,
+                              "message": "Windows accepted the application launch request; visible-window state was not independently verified."}
+                    if key == "notepad":
+                        focus = _focus_notepad_window()
+                        result.update({"focus_verified": bool(focus.get("verified")),
+                                       "verified": bool(focus.get("verified")),
+                                       "window_title": focus.get("window_title"),
+                                       "focus_method": focus.get("method")})
+                        if not focus.get("ok"):
+                            if focus.get("window_found"):
+                                result.update({"ok": True, "verified": False})
+                            else:
+                                result.update({"ok": False,
+                                               "error_code": focus.get("error_code", "FOCUS_FAILED"),
+                                               "error": focus.get("error", "Notepad launch was requested but its foreground window could not be verified.")})
+                    return result
+                except (OSError, subprocess.SubprocessError) as exc:
+                    tried.append(f"{candidate}: {type(exc).__name__}: {exc}")
+            return {"ok": False, "not_found": not tried,
+                    "error_code": "APP_LAUNCH_FAILED" if tried else "APP_NOT_INSTALLED",
+                    "error": "Could not launch the Windows application directly." + (" " + "; ".join(tried) if tried else " No executable was found in System32 or PATH."),
+                    "launch_requested": False}
         display_values = ",".join("'" + name.replace("'", "''") + "'" for name in spec["display"])
         executable_values = ",".join("'" + name.replace("'", "''") + "'" for name in spec["executables"])
         protocol = spec.get("protocol", "")
@@ -332,13 +919,18 @@ foreach ($name in $displayNames) {{
     }}
 }}
 foreach ($exeName in $exeNames) {{
-    $cmd = Get-Command -Name $exeName -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($cmd -and $cmd.Source) {{
+    $commands = @(Get-Command -Name $exeName -CommandType Application -ErrorAction SilentlyContinue)
+    foreach ($cmd in $commands) {{
+        if ($cmd -and $cmd.Source) {{
+        # The Notepad execution alias under WindowsApps can open Microsoft Store
+        # when the packaged app is missing. Never follow that alias as a fallback.
+        if ({'$true' if key == 'notepad' else '$false'} -and $cmd.Source -match '(?i)\\WindowsApps\\') {{ continue }}
         try {{
             Start-Process -FilePath $cmd.Source -ErrorAction Stop
-            [pscustomobject]@{{ok=$true;opened=$exeName;method='installed_app';launch_requested=$true}} | ConvertTo-Json -Compress
+            [pscustomobject]@{{ok=$true;opened=$exeName;method='installed_app';launch_requested=$true;path=$cmd.Source}} | ConvertTo-Json -Compress
             exit 0
         }} catch {{ $lastError = $_.Exception.Message }}
+        }}
     }}
 }}
 if ({'$true' if key == 'vs code' else '$false'}) {{
@@ -372,6 +964,16 @@ if ($protocol) {{
 """
         result = _ps(script, timeout=12)
         if result.get("ok"):
+            if key == "notepad":
+                focus = _focus_notepad_window()
+                result.update({"focus_verified": bool(focus.get("verified")),
+                               "verified": bool(focus.get("verified")),
+                               "window_title": focus.get("window_title"),
+                               "focus_method": focus.get("method")})
+                if not focus.get("ok"):
+                    result.update({"ok": False,
+                                   "error_code": focus.get("error_code", "FOCUS_FAILED"),
+                                   "error": focus.get("error")})
             return result
         # Let execute() try the browser fallback. Preserve a hard launch error
         # for the caller so it is not mistaken for a successful native launch.
@@ -401,6 +1003,17 @@ def _normalise_web_target(value: str) -> str:
     if alias_url:
         return alias_url
     if re.match(r"^https?://", value, re.I):
+        # Never pass malformed URLs, embedded credentials, or control characters
+        # to the OS browser handler. Local HTTP URLs remain available when the
+        # user explicitly requests them (e.g. a local router/admin page).
+        from urllib.parse import urlsplit
+        if any(ord(char) < 32 for char in value):
+            raise ValueError("URLs cannot contain control characters.")
+        parsed = urlsplit(value)
+        if not parsed.hostname:
+            raise ValueError("The URL must include a hostname.")
+        if parsed.username is not None or parsed.password is not None:
+            raise ValueError("URLs containing embedded credentials are not supported.")
         return value
     if re.match(r"^(?:www\.)?[\w.-]+\.[a-z]{2,}(?:/.*)?$", value, re.I):
         return "https://" + value if not value.lower().startswith("www.") else "https://" + value
@@ -500,85 +1113,11 @@ def _play_youtube(song_name: str):
                 "error": f"pywhatkit could not start YouTube playback: {type(exc).__name__}: {exc}"}
 
 
-def _spotify_api_access_token():
-    """Return a Spotify user access token when explicitly configured.
-
-    A refresh token can be configured with SPOTIFY_REFRESH_TOKEN plus
-    SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET. Credentials are read only
-    from the process environment; EVA never prompts for or stores secrets.
-    """
-    access_token = os.environ.get("SPOTIFY_ACCESS_TOKEN", "").strip()
-    if access_token:
-        return access_token
-
-    refresh_token = os.environ.get("SPOTIFY_REFRESH_TOKEN", "").strip()
-    client_id = os.environ.get("SPOTIFY_CLIENT_ID", "").strip()
-    client_secret = os.environ.get("SPOTIFY_CLIENT_SECRET", "").strip()
-    if not (refresh_token and client_id and client_secret):
-        return None
-
-    body = urlencode({"grant_type": "refresh_token", "refresh_token": refresh_token}).encode("utf-8")
-    auth = base64.b64encode(f"{client_id}:{client_secret}".encode("utf-8")).decode("ascii")
-    request = Request(
-        "https://accounts.spotify.com/api/token",
-        data=body,
-        headers={"Authorization": f"Basic {auth}", "Content-Type": "application/x-www-form-urlencoded"},
-        method="POST",
-    )
-    with urlopen(request, timeout=8) as response:
-        payload = json.loads(response.read().decode("utf-8"))
-    token = payload.get("access_token")
-    if not token:
-        raise RuntimeError("Spotify did not return an access token.")
-    return token
-
-
-def _spotify_api_play(song: str):
-    """Try authenticated Spotify search + playback; return None if not configured.
-
-    Real playback requires a user-authorized token with the
-    user-modify-playback-state scope and an available active playback device.
-    """
-    token = _spotify_api_access_token()
-    if not token:
-        return None
-
-    search_url = "https://api.spotify.com/v1/search?" + urlencode({"q": song, "type": "track", "limit": 1})
-    search_request = Request(search_url, headers={"Authorization": f"Bearer {token}"})
-    with urlopen(search_request, timeout=8) as response:
-        payload = json.loads(response.read().decode("utf-8"))
-    tracks = payload.get("tracks", {}).get("items", [])
-    if not tracks:
-        return {"ok": False, "action": "play_spotify", "query": song,
-                "error": "Spotify search returned no matching tracks."}
-
-    track = tracks[0]
-    uri = track.get("uri")
-    if not uri:
-        return {"ok": False, "action": "play_spotify", "query": song,
-                "error": "Spotify search result did not include a playable track URI."}
-    play_request = Request(
-        "https://api.spotify.com/v1/me/player/play",
-        data=json.dumps({"uris": [uri]}).encode("utf-8"),
-        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-        method="PUT",
-    )
-    with urlopen(play_request, timeout=8) as response:
-        # Spotify normally returns HTTP 204 for a successful playback request.
-        status = getattr(response, "status", 204)
-    artists = [artist.get("name", "") for artist in track.get("artists", []) if artist.get("name")]
-    return {"ok": True, "action": "play_spotify", "query": song,
-            "method": "spotify_web_api", "playback_requested": True,
-            "track": track.get("name", song), "artists": artists, "spotify_uri": uri,
-            "http_status": status,
-            "note": "Spotify accepted the playback request. Actual sound depends on account eligibility and an active playback device."}
-
-
 def _launch_spotify_app_search(song: str):
     """Open a song search in the native Spotify app, or report app absence.
 
-    This only requests the search page. Selecting and playing the exact track
-    without user interaction requires an authorized Spotify playback API token.
+    This only requests the search page. The no-API integration does not select a
+    track automatically; the user may choose the desired result in Spotify.
     """
     encoded_query = quote(song, safe="")
     app_uri = f"spotify:search:{encoded_query}"
@@ -607,7 +1146,7 @@ if (-not $schemeRegistered -and -not $exePath -and $startApps.Count -eq 0) {{
 try {{
   if ($schemeRegistered) {{
     Start-Process -FilePath $uri -ErrorAction Stop
-    [pscustomobject]@{{ok=$true;method='spotify_app_search';opened=$uri;app_detected=$true;launch_requested=$true;playback_requested=$false;note='Opened Spotify desktop search. A track still needs selection unless authorized API playback is configured.'}} | ConvertTo-Json -Compress
+    [pscustomobject]@{{ok=$true;method='spotify_app_search';opened=$uri;app_detected=$true;launch_requested=$true;playback_requested=$false;note='Opened Spotify desktop search. Select the desired track in Spotify; automated account playback is not integrated.'}} | ConvertTo-Json -Compress
     exit 0
   }}
   if ($exePath) {{
@@ -684,7 +1223,7 @@ def _spotify_desktop_ui_play(song: str):
     Spotify documents Ctrl+K as opening Quick Search; entering a query and
     choosing a result starts that selection. We only send these keys after
     finding and activating a window whose title contains Spotify. Otherwise
-    return a failure so the caller can use API/search fallbacks honestly.
+    report failure so the caller can use the public web-search fallback.
     """
     if platform.system().lower() != "windows":
         return None
@@ -748,24 +1287,18 @@ def _spotify_desktop_ui_play(song: str):
                 "error": f"Spotify keyboard playback could not be requested ({type(exc).__name__}: {exc})."}
 
 def _play_spotify(song_name: str):
-    """Prefer Spotify desktop, use authorized playback when available, else web.
+    """Search through the installed Spotify app or its ordinary public website.
 
-    EVA first checks/opens the installed app's song search. If user-authorized
-    Spotify playback is configured, it then asks the API to start the exact
-    track on the active Spotify device. If the app cannot be found/opened, EVA
-    falls back to Spotify Web search instead of claiming playback succeeded.
+    This path intentionally does not use Spotify Web API credentials or any
+    external API. It can open/search the app or website, but cannot promise
+    automatic playback when UI control or account state prevents it.
     """
     song = song_name.strip().strip("\"'")
     if not song:
         return {"ok": False, "action": "play_spotify", "error": "Please include a song or artist name."}
 
-    # App-first is intentional: the user asked Spotify, so prefer the desktop
-    # app and only use the website if its search URI cannot be opened.
     native_result = _launch_spotify_app_search(song)
     if native_result and native_result.get("ok"):
-        # On Windows, finish the action through Spotify's native Quick Search
-        # so the command attempts to start a track rather than merely opening
-        # search results. Never send keystrokes unless a Spotify window was found.
         ui_result = _spotify_desktop_ui_play(song)
         if ui_result and ui_result.get("ok"):
             ui_result["app_launch"] = {
@@ -773,56 +1306,51 @@ def _play_spotify(song_name: str):
                 "opened": native_result.get("opened", f"spotify:search:{quote(song, safe='')}"),
             }
             return ui_result
-
-        api_warning = None
-        try:
-            api_result = _spotify_api_play(song)
-            if api_result is not None:
-                if api_result.get("ok"):
-                    api_result["app_launch"] = {
-                        "method": native_result.get("method", "spotify_app_search"),
-                        "opened": native_result.get("opened", f"spotify:search:{quote(song, safe='')}"),
-                    }
-                    api_result["note"] = (
-                        "Spotify desktop was opened first, then Spotify accepted the playback request. "
-                        "Audio output depends on the account's active/eligible Spotify device."
-                    )
-                    return api_result
-                api_warning = api_result.get("error") or "Spotify API playback could not be started."
-        except HTTPError as exc:
-            api_warning = f"Spotify API returned HTTP {exc.code}; left the song search open in Spotify desktop."
-        except (URLError, TimeoutError, OSError, ValueError, RuntimeError) as exc:
-            api_warning = f"Spotify API playback was unavailable ({type(exc).__name__}); left the song search open in Spotify desktop."
-        except Exception as exc:
-            api_warning = f"Spotify API playback was unavailable ({type(exc).__name__}); left the song search open in Spotify desktop."
-
         result = {**native_result, "action": "play_spotify", "query": song,
                   "playback_requested": False,
-                  "note": native_result.get("note") or "Opened the song search in the installed Spotify desktop app, but automatic playback could not be requested. Select a track manually or configure Spotify playback authorization."}
+                  "note": "Opened the Spotify app search. Automatic playback could not be verified without successful UI control; select the desired track manually."}
         if ui_result and ui_result.get("error"):
             result["ui_playback_warning"] = ui_result["error"]
-        if api_warning:
-            result["api_warning"] = api_warning
         return result
 
-    # Desktop app is missing or the app URI could not be opened: use Spotify Web.
+    # Normal public web search, not an API. Playback may require sign-in and
+    # user selection in Spotify Web.
     url = "https://open.spotify.com/search/" + quote_plus(song)
     browser_result = _open_browser_url(url)
     result = {**browser_result, "action": "play_spotify", "query": song,
               "method": "browser_search_fallback", "playback_requested": False,
-              "note": "Spotify desktop search was unavailable, so EVA requested Spotify Web search results. Playback may require sign-in and selecting a track."}
+              "note": "Spotify app search was unavailable, so EVA opened Spotify Web search. Playback may require sign-in and selecting a track."}
     if native_result and native_result.get("error"):
         result["native_app_warning"] = native_result["error"]
     return result
 
 
-def execute(action: str, value: str = ""):
+def execute(action: str, value: str = "", *, target: str | None = None):
     """Execute one allow-listed desktop action and return a structured result."""
     system = platform.system().lower()
+    if action == "notepad_new_document":
+        return _new_notepad_document()
+    if action == "type" and system == "windows":
+        if target:
+            if target.strip().casefold() not in {"notepad", "windows notepad"}:
+                return {"ok": False, "error_code": "TARGET_NOT_SUPPORTED",
+                        "error": "Targeted text entry currently supports Notepad only."}
+            focus = _focus_notepad_window()
+            if not focus.get("ok"):
+                return focus
+        else:
+            foreground = _foreground_window_details()
+            terminal_processes = {
+                "windowsterminal.exe", "openconsole.exe",
+                "conhost.exe", "cmd.exe", "powershell.exe", "pwsh.exe",
+            }
+            terminal_title = re.search(r"\b(?:windows terminal|command prompt|powershell)\b",
+                                       foreground["title"], re.I)
+            if foreground["process"] in terminal_processes or terminal_title:
+                return {"ok": False, "verified": True, "error_code": "TERMINAL_FOCUS_BLOCKED",
+                        "error": "Text was not pasted because a terminal is focused. Ask EVA to open the intended app and retry."}
     if action == "create_file":
         return _create_file(value)
-    if action == "public_ip":
-        return _public_ip()
     if action == "play_youtube":
         return _play_youtube(value)
     if action == "play_spotify":
@@ -834,18 +1362,49 @@ def execute(action: str, value: str = ""):
             "music", "music folder", "videos", "videos folder",
         }
         app_key = value.strip().lower()
+        # Ignore ordinary terminal punctuation from natural-language commands.
+        # This is deliberately only for app/folder aliases, not arbitrary paths.
+        app_key = re.sub(r"[\s.,!?;:]+$", "", app_key)
         if app_key not in folder_names:
+            native_app_names = {
+                "spotify", "whatsapp", "instagram", "facebook", "youtube", "notepad",
+                "camera", "calculator", "paint", "ms paint", "chrome", "google chrome", "edge", "microsoft edge",
+                "firefox", "vlc", "discord", "telegram", "zoom", "slack", "steam",
+                "vs code", "vscode", "visual studio code", "microsoft teams", "teams",
+            }
             native_result = _try_open_native_app(app_key)
             if native_result is not None and native_result.get("ok"):
                 return native_result
-            # If a known app can also be used from the browser, fall back there
-            # rather than falsely claiming an unavailable desktop app launched.
             aliases = _website_aliases()
+            if app_key in native_app_names:
+                # A few apps have explicit, curated web clients (e.g. Spotify Web
+                # and vscode.dev). These are deterministic official destinations,
+                # not searches and never the Microsoft Store. Do not apply this to
+                # native-only apps such as Notepad or Calculator.
+                web_fallback_apps = {
+                    "spotify", "whatsapp", "instagram", "facebook", "youtube",
+                    "chrome", "edge", "firefox", "discord", "telegram", "zoom",
+                    "slack", "steam", "vs code", "vscode", "visual studio code",
+                    "teams", "microsoft teams",
+                }
+                if app_key in web_fallback_apps and app_key in aliases:
+                    return _open_browser_url(aliases[app_key])
+                # Opening a native-only app is not permission to search for it or
+                # open Store. If no installed executable/app registration was found,
+                # report that capability gap directly.
+                return native_result or {
+                    "ok": False, "error_code": "APP_NOT_INSTALLED",
+                    "error": f"Could not find a launchable installed copy of '{app_key}'. No browser or Microsoft Store fallback was attempted.",
+                    "launch_requested": False, "target": app_key,
+                }
+            # Known website aliases may use the default browser, but an unknown
+            # desktop target must not silently become a search query or invoke a
+            # Windows protocol handler that could open Microsoft Store.
             if app_key in aliases:
-                browser_result = _open_browser_url(aliases[app_key])
-                if native_result is not None and native_result.get("error"):
-                    browser_result["native_app_warning"] = native_result["error"]
-                return browser_result
+                return _open_browser_url(aliases[app_key])
+            return {"ok": False, "error_code": "TARGET_NOT_REGISTERED",
+                    "error": f"'{value.strip()}' is not a registered desktop application or known website. No browser search or Microsoft Store fallback was attempted.",
+                    "launch_requested": False, "target": value.strip()}
     if action == "web":
         # For known desktop apps, first request a native app launch. If the app
         # is absent or its launch fails, explicitly open its website in a new tab.
@@ -908,7 +1467,20 @@ def execute(action: str, value: str = ""):
         except (OSError, subprocess.TimeoutExpired) as exc:
             return {"ok": False, "error": str(exc)}
     if system == "windows":
-        return _windows(action, value)
+        result = _windows(action, value)
+        if action == "type" and target and isinstance(result, dict) and result.get("ok"):
+            readback = _verify_notepad_text(value)
+            result["readback"] = {key: val for key, val in readback.items() if key != "readable"}
+            if readback.get("verified"):
+                result["verified"] = True
+                result["message"] = str(readback.get("message", "Notepad text was verified."))
+            elif readback.get("readable"):
+                result.update({"ok": False, "verified": False, "error_code": "TEXT_ENTRY_READBACK_MISMATCH",
+                               "error": str(readback.get("message", "Notepad text did not match the requested content."))})
+            else:
+                result["verified"] = False
+                result["message"] = str(readback.get("message", result.get("message", "Typing was not independently verified.")))
+        return result
     return {"ok": False, "error": f"Desktop automation is not implemented for {platform.system()}. Supported: Windows and macOS."}
 
 
@@ -970,6 +1542,8 @@ def _resolve_website_targets(fragment: str):
     for key in known:
         aliases.setdefault(key, key)
     # Ignore harmless connective/descriptive words, but don't silently discard unknown targets.
+    # Strip ordinary sentence-final punctuation from a conversational target.
+    fragment = re.sub(r"[\s.,!?;:]+$", "", fragment)
     fragment = re.sub(r"\b(?:please|the|app|application|website|websites|site|sites|web|desktop|and|then|also|tabs?)\b", " ", fragment, flags=re.I)
     fragment = fragment.replace(",", " ").replace("&", " ")
     words = re.findall(r"[a-z0-9.+-]+", fragment.lower())
@@ -999,9 +1573,11 @@ def _resolve_mixed_open_targets(fragment: str):
         "notepad": "notepad", "note pad": "notepad",
         "camera": "camera", "windows camera": "camera",
         "calculator": "calculator", "calc": "calculator",
+        "paint": "paint", "ms paint": "paint",
         "vs code": "vs code", "vscode": "vs code", "visual studio code": "vs code",
         "whatsapp": "whatsapp", "spotify": "spotify", "chrome": "chrome",
         "edge": "edge", "firefox": "firefox", "vlc": "vlc",
+        "telegram": "telegram", "github": "github",
     }
     # Website aliases are destinations that can also try a native app first.
     aliases = {key: key for key in _website_aliases()}
@@ -1013,10 +1589,13 @@ def _resolve_mixed_open_targets(fragment: str):
         "fb": "facebook", "face book": "facebook", "drive": "google drive",
         "whatsap": "whatsapp", "whatsupp": "whatsapp", "watsapp": "whatsapp", "whatapp": "whatsapp", "whats app": "whatsapp",
     })
-    fragment = re.sub(r"\b(?:please|the|app|application|website|websites|site|sites|web|desktop|and|then|also|tabs?)\b", " ", fragment, flags=re.I)
+    # Sentence-final punctuation must not become part of an app/site token.
+    fragment = re.sub(r"[\s.,!?;:]+$", "", fragment)
+    fragment = re.sub(r"\b(?:please|the|apps?|applications?|in\s+this\s+order|in\s+order|order|website|websites|site|sites|web|desktop|and|then|also|tabs?|open|launch|start|run|go\s+to|visit|two|three|four|five|six|seven|eight|nine|ten|following|these|those|several|multiple)\b", " ", fragment, flags=re.I)
     fragment = fragment.replace(",", " ").replace("&", " ")
     words = re.findall(r"[a-z0-9.+-]+", fragment.lower())
     found = []
+    filler = {"in", "this", "order", "apps", "app", "applications", "application", "open", "launch", "start", "run", "go", "to", "please", "and", "then", "also", "with", "all", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "the", "these", "those", "following", "several", "multiple", "named", "called", "like", "such", "as", "first", "second", "third", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10"}
     i = 0
     while i < len(words):
         matched = None
@@ -1026,9 +1605,12 @@ def _resolve_mixed_open_targets(fragment: str):
                 matched = aliases[phrase]
                 i += width
                 break
-        if matched is None:
+        if matched is not None:
+            found.append(matched)
+        elif words[i] in filler:
+            i += 1
+        else:
             return []
-        found.append(matched)
     return list(dict.fromkeys(found))
 
 
@@ -1080,18 +1662,33 @@ def _multi_action(text: str):
         return None
 
     result_items = []
+    last_media_query: str | None = None
+    last_opened_target: str | None = None
     for clause in clauses:
         # Song searches on YouTube/Spotify. This opens results; it does not
         # claim playback started because login and user interaction may be needed.
         m = re.fullmatch(r"(?:please\s+)?(?:play|find|search for)\s+(.+?)\s+(?:on|in)\s+(.+)", clause, re.I)
         if m:
-            title = m.group(1).strip().strip('"\'')
+            raw_title = m.group(1).strip().strip('"\'')
+            is_same_ref = bool(re.match(r"^(?:the\s+same(?:\s+(?:song|music|track|query|video|one|thing))?|that(?:\s+(?:song|music|track|one))?|same)$", raw_title, re.I))
+            if is_same_ref:
+                if last_media_query:
+                    title = last_media_query
+                else:
+                    result_items.append({"command": clause, "ok": False,
+                                         "error": f"Ambiguous reference '{raw_title}': no previous media query was found in earlier clauses."})
+                    continue
+            else:
+                title = raw_title
+                last_media_query = title
+
             tail = re.sub(r"\b(?:please|the|app|website|site)\b", " ", m.group(2), flags=re.I)
             raw_targets = re.split(r"\s*(?:,|\band\b|\bor\b)\s*", tail, flags=re.I)
             targets = [x.strip().lower() for x in raw_targets if x.strip()]
             targets = [x for x in targets if x in {"youtube", "spotify"}]
             if title and targets:
                 for target in dict.fromkeys(targets):
+                    last_opened_target = target
                     if target == "youtube":
                         r = execute("play_youtube", title)
                         result_items.append({**r, "command": clause, "action": "play_youtube",
@@ -1142,6 +1739,14 @@ def route_and_execute(text: str):
     """Map a natural-language request to a safe, explicit automation action."""
     s = text.strip()
     low = s.lower()
+    # Once a request starts with an explicit type/write command, keep the entire
+    # remainder literal. Drafts commonly span lines and can contain words like
+    # "open" or "close" that must not be reinterpreted as desktop commands.
+    freeform_type = re.fullmatch(r"(?:please\s+)?(?:type|write)\s+([\s\S]+)", s, re.I)
+    if freeform_type:
+        result = execute("type", freeform_type.group(1))
+        result["action"] = "type"
+        return result
     # Accept the handler name as a user-facing diagnostic command rather than
     # letting it fall through to ordinary chat.
     if re.fullmatch(r"/?(?:desktop[_ -]?automation|automation status|check automation|automation help|what can you control)[.!]?", low):
@@ -1155,6 +1760,16 @@ def route_and_execute(text: str):
             "take a screenshot", "list apps", "increase volume",
         ])
         return result
+    youtube_search = re.fullmatch(
+        r"(?:please\s+)?(?:open|launch|start)\s+(?:the\s+)?youtube(?:\s+(?:app|website))?\s+and\s+search(?:\s+for)?\s+(.+)",
+        s, re.I,
+    )
+    if youtube_search:
+        query = youtube_search.group(1).strip().strip("\"'")
+        url = "https://www.youtube.com/results?search_query=" + quote_plus(query)
+        result = _open_browser_url(url)
+        return {**result, "action": "youtube_search", "query": query,
+                "url": url, "playback_requested": False}
     multi = _multi_action(s)
     if multi is not None:
         return multi
@@ -1176,7 +1791,6 @@ def route_and_execute(text: str):
     if spotify_match:
         return _play_spotify(spotify_match.group(1))
     patterns = [
-        (r"\b(?:public ip|my public ip|external ip|find my ip)\b", "public_ip", ""),
         (r"\b(?:create|make|new)\s+(?:a\s+)?(?:python|java|text|html|css|javascript|js|json|xml|csv|markdown|yaml|yml|pdf|word|excel|powerpoint)\s+file\b", "create_file", ""),
         (r"\bopen new tab\b", "keys", "ctrl+t"),
         (r"\bclose (?:this )?tab\b", "keys", "ctrl+w"),
@@ -1214,7 +1828,7 @@ def route_and_execute(text: str):
         (r"\b(?:audio devices|sound devices|check audio devices)\b", "audio_devices", ""),
         (r"\b(?:test|check)\s+(?:the\s+)?microphone\b|\bmic test\b", "mic_test", ""),
         (r"\b(?:test|check)\s+(?:the\s+)?speakers?\b|\bspeaker test\b", "speaker_test", ""),
-        (r"\b(?:lock (?:the )?(?:computer|pc|screen|workstation))\b", "lock_screen", ""),
+        (r"\b(?:lock (?:the |my )?(?:computer|pc|screen|workstation))\b", "lock_screen", ""),
         (r"\b(?:brightness|screen brightness)\b.*\b(?:up|increase|brighter|higher)\b|\b(?:increase|raise)\b.*\bbrightness\b", "brightness_up", ""),
         (r"\b(?:brightness|screen brightness)\b.*\b(?:down|decrease|dimmer|lower)\b|\b(?:decrease|lower)\b.*\bbrightness\b", "brightness_down", ""),
         (r"\b(?:set|change)\b.{0,15}\bbrightness\b.{0,10}\b\d{1,3}\b", "brightness_set", ""),
@@ -1233,7 +1847,6 @@ def route_and_execute(text: str):
         (r"\b(?:take|capture|make)\b.*\b(?:a )?screenshot\b|\bscreenshot\b", "screenshot", ""),
         (r"\b(?:read|get|show)\b.*\bclipboard\b", "clipboard_get", ""),
         (r"\b(?:copy|put|set)\b.*\bclipboard\b", "clipboard_set", ""),
-        (r"\b(?:type|write)\b.+", "type", ""),
         (r"\b(?:notify|notification|show a message)\b", "notify", ""),
         (r"\b(?:say aloud|speak|read aloud)\b", "say", ""),
         (r"\b(?:open|launch|start)\b.*\b(?:website|site|url|browser|youtube|google|github|chatgpt|gmail|reddit|spotify|netflix)\b", "web", ""),
